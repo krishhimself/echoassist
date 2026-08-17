@@ -1,68 +1,107 @@
-"""
-api.py  --  FastAPI wrapper around predict.analyze()
-Endpoints:
-    GET  /health     liveness + model status
-    POST /analyze    multipart WAV upload -> JSON analysis result
-Run:
-    .venv\\Scripts\\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8000
-"""
-
+# api.py - EchoAssist FastAPI backend
+# Run: .venv/Scripts/uvicorn.exe api:app --reload --port 8000
+import io
 import tempfile
 from pathlib import Path
-from typing import Any
 
+import librosa
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+import soundfile as sf
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-from predict import analyze
+from predict import analyze, SR
 
-app = FastAPI(title="EchoAssist API", version="1.0")
+app = FastAPI(title="EchoAssist API", version="2.0")
 
-_MODEL_FILE = next((p for p in ["model2.pth", "model.pth"] if Path(p).exists()), None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-def _serialise(obj: Any) -> Any:
-    """Recursively convert numpy types to plain Python for JSON serialisation."""
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, tuple):
-        return [_serialise(v) for v in obj]
-    if isinstance(obj, list):
-        return [_serialise(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _serialise(v) for k, v in obj.items()}
-    return obj
+SAMPLES_DIR = Path("samples")
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model": _MODEL_FILE,
-        "model_exists": _MODEL_FILE is not None and Path(_MODEL_FILE).exists(),
-    }
+def _safe_result(result: dict) -> dict:
+    """Convert numpy arrays to JSON-serialisable Python lists."""
+    out = {}
+    for k, v in result.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        elif isinstance(v, (np.floating, np.integer)):
+            out[k] = v.item()
+        else:
+            out[k] = v
+    return out
 
 
-@app.post("/analyze")
-async def analyze_audio(file: UploadFile = File(...)):
-    audio_bytes = await file.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty file uploaded")
-
-    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+@app.post("/api/analyze")
+async def analyze_upload(file: UploadFile = File(...)):
+    """Analyse an uploaded audio file. Returns full prediction dict."""
+    suffix = Path(file.filename).suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
+        tmp.write(await file.read())
         tmp_path = tmp.name
-
     try:
         result = analyze(tmp_path)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+    return JSONResponse(_safe_result(result))
 
-    if "error" in result:
-        raise HTTPException(status_code=422, detail=result["error"])
 
-    return JSONResponse(content=_serialise(result))
+@app.get("/api/analyze/sample/{name}")
+async def analyze_sample(name: str):
+    """Analyse one of the curated gallery samples by filename."""
+    wav = SAMPLES_DIR / name
+    if not wav.exists():
+        raise HTTPException(status_code=404, detail=f"Sample not found: {name}")
+    result = analyze(str(wav))
+    return JSONResponse(_safe_result(result))
+
+
+@app.get("/api/salient-audio/{name}")
+async def salient_audio(name: str, t0: float = 0.0, t1: float = 1.0):
+    """Return the salient 1-second audio segment as a WAV stream."""
+    wav = SAMPLES_DIR / name
+    if not wav.exists():
+        raise HTTPException(status_code=404, detail="Sample not found")
+    y, _ = librosa.load(str(wav), sr=SR)
+    peak = np.max(np.abs(y))
+    if peak > 0:
+        y = y / peak
+    s0, s1 = int(t0 * SR), int(t1 * SR)
+    segment = y[s0:s1]
+    if len(segment) == 0:
+        segment = y[:SR]
+    buf = io.BytesIO()
+    sf.write(buf, segment, SR, format="WAV")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="audio/wav")
+
+
+@app.get("/api/samples")
+async def list_samples():
+    """List available curated sample files."""
+    SAMPLE_META = [
+        {"label": "Normal — patient 210",  "file": "normal_patient210_Al.wav",  "class": "normal"},
+        {"label": "Normal — patient 112",  "file": "normal_patient112_Ar.wav",  "class": "normal"},
+        {"label": "Crackle — patient 223", "file": "crackle_patient223_Lr.wav", "class": "crackle"},
+        {"label": "Crackle — patient 205", "file": "crackle_patient205_Ar.wav", "class": "crackle"},
+        {"label": "Wheeze — patient 223",  "file": "wheeze_patient223_Ar.wav",  "class": "wheeze"},
+        {"label": "Wheeze — patient 206",  "file": "wheeze_patient206_Pl.wav",  "class": "wheeze"},
+        {"label": "Both — patient 156",    "file": "both_patient156_Pr.wav",    "class": "both"},
+        {"label": "Silent (edge case)",    "file": "silent.wav",               "class": None},
+        {"label": "Too short (edge case)", "file": "short.wav",                "class": None},
+    ]
+    available = [s for s in SAMPLE_META if (SAMPLES_DIR / s["file"]).exists()]
+    return available
+
+
+# Serve frontend static files — mount last so API routes take priority
+frontend_dir = Path("frontend")
+if frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

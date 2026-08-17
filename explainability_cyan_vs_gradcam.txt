@@ -1,0 +1,69 @@
+================================================================================
+ECHOASSIST — CYAN BAND (OCCLUSION) VS. GRAD-CAM HEATMAP EXPLAINABILITY
+================================================================================
+
+1. WHAT IS THE CYAN BAND? (Occlusion Analysis — 1D Temporal Salience)
+--------------------------------------------------------------------------------
+The Cyan Vertical Band answers the question: 
+"WHICH 1-SECOND TIME INTERVAL IN THE RECORDING DRIVES THE PREDICTION?"
+
+How it is calculated:
+1. EchoAssist takes the 5-second audio probe and measures its baseline confidence score.
+2. It iteratively mutes 1-second audio chunks (setting samples to zero):
+   - Chunk 0: Seconds 0.0 to 1.0 muted
+   - Chunk 1: Seconds 1.0 to 2.0 muted
+   - Chunk 2: Seconds 2.0 to 3.0 muted
+   - Chunk 3: Seconds 3.0 to 4.0 muted
+   - Chunk 4: Seconds 4.0 to 5.0 muted
+3. For each muted chunk, it re-runs prediction and measures:
+   confidence_drop = baseline_confidence - muted_confidence
+4. The 1-second chunk that causes the LARGEST drop in confidence when muted is 
+   selected as the "salient region".
+5. The dashboard draws a full vertical CYAN BAND spanning that 1-second interval 
+   across all frequency Mel bins.
+
+
+================================================================================
+2. WHAT IS THE GRAD-CAM HEATMAP? (2D Time-Frequency Gradient Attribution)
+================================================================================
+The Grad-CAM Heatmap answers the question:
+"WHICH EXACT 2D PITCH FREQUENCIES AND TIME INSTANTS ACTIVATED THE CNN NEURONS?"
+
+How it is calculated:
+1. PyTorch registers forward and backward hooks on the last convolutional layer 
+   of ResNet18 (model.layer4[-1]).
+2. The 5-second audio spectrogram tensor is passed through the network.
+3. The loss gradient with respect to the winning class (e.g., target_label="crackle") 
+   is backpropagated: d(score) / d(feature_map_k).
+4. Global average pooling computes a weight w_k for each of the 512 feature channels.
+5. A weighted sum of feature activation maps is calculated and passed through a 
+   ReLU activation (retaining only positive contributions toward the class).
+6. The resulting 2D matrix is resized to (64 Mel bins x 157 time frames) and 
+   overlaid as a JET heatmap (Red/Yellow = high neural focus, Blue = ignored).
+
+
+================================================================================
+3. WHY THEY COMPLEMENT EACH OTHER (TIME vs. TIME-FREQUENCY)
+================================================================================
+
+Feature Aspect        | Cyan Band (Occlusion)          | Grad-CAM Heatmap
+----------------------|--------------------------------|--------------------------------
+Domain Dimension      | 1D Time Interval (X-axis)      | 2D Time + Pitch Frequency (X & Y)
+Granularity           | Coarse (1-second block)        | Fine-grained (Pixel-level)
+Methodology           | Causal Muting Perturbation     | Gradient Backpropagation
+Question Answered     | "WHEN did the sound occur?"   | "WHAT pitch & acoustic feature?"
+
+
+================================================================================
+4. HOW THEY MATCH AND ALIGN
+================================================================================
+- The Cyan Band highlights the broad 1-second TIME WINDOW (e.g., Seconds 2 to 3) 
+  where the key breathing event occurred.
+- The Grad-CAM Heatmap highlights the exact SPECTRAL PITCH (e.g., 1200 Hz wheeze streak 
+  or 500-1500 Hz crackle click) inside or near that 1-second window.
+
+- By updating generate_gradcam(y, target_label=winning_label) to target the exact winning 
+  class score, both explainability views now compute attributions for the exact same 
+  acoustic target. The brightest Red/Yellow Grad-CAM hotspots align directly within 
+  or adjacent to the time span shaded by the Cyan band!
+================================================================================

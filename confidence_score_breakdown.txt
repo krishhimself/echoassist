@@ -1,0 +1,82 @@
+================================================================================
+ECHOASSIST — CONFIDENCE SCORE & SIGNAL QUALITY THRESHOLD EXPLANATION
+================================================================================
+
+1. HOW THE CONFIDENCE SCORE IS CALCULATED (STEP-BY-STEP)
+--------------------------------------------------------------------------------
+The confidence score measures how strongly the neural network identifies the winning 
+acoustic class across the entire breathing recording.
+
+Step 1: 5-Second Window Segmentation
+   The audio signal y (sampled at 4000 Hz) is divided into 5-second non-overlapping 
+   breath cycle windows (20,000 samples each).
+
+Step 2: Neural Network Multi-Label Inferences
+   Each 5-second window is passed through ResNet18. The model outputs two independent 
+   sigmoids: p_crackle and p_wheeze. 
+   
+   These are converted into joint probabilities across the 4 sound categories for window i:
+     - P_i(both)    = p_crackle * p_wheeze
+     - P_i(crackle) = p_crackle * (1 - p_wheeze)
+     - P_i(wheeze)  = (1 - p_crackle) * p_wheeze
+     - P_i(normal)  = (1 - p_crackle) * (1 - p_wheeze)
+
+Step 3: Time-Averaging Across Windows
+   The probabilities from all 5-second windows are averaged:
+     mean_probs = np.mean(all_probs, axis=0)
+
+Step 4: Winning Class & Confidence Score Extraction
+   - top_idx = np.argmax(mean_probs)
+   - label   = CLASSES[top_idx]
+   - confidence = float(mean_probs[top_idx])
+
+   The Confidence Score is simply the numerical value of the top class's mean 
+   probability (ranging from 0.00 to 1.00, or 0% to 100%).
+
+
+================================================================================
+2. CONFIDENCE WINDOWS & SIGNAL QUALITY THRESHOLDS
+================================================================================
+
+Because there are 4 mutually exclusive classes, a purely random guess produces 
+a baseline probability of 0.25 (25%). The confidence score is categorized into 
+three operational windows:
+
+--------------------------------------------------------------------------------
+WINDOW 1: BAD / UNUSABLE AUDIO (Refusal Window)
+Range:         0.00 to 0.15 (0% to 15%)
+Threshold:     confidence < 0.15 (CONF_THR)
+System Status: REFUSED (Graceful refusal triggered)
+Explanation:   The top probability is lower than random chance (below 15%). The audio 
+               is either flatline silence, corrupted static, or severe noise. 
+               The system stops processing and displays:
+               "Signal quality too low (confidence=X.XX). Re-record."
+
+--------------------------------------------------------------------------------
+WINDOW 2: POOR QUALITY / MODERATE UNCERTAINTY WINDOW
+Range:         0.15 to 0.30 (15% to 30%)
+System Status: PROCESSED, tagged as [poor quality]
+Explanation:   The signal contains detectable audio features, but the probability 
+               margin is narrow (near baseline random chance). The system processes 
+               the recording, displays the prediction, spectrogram, and Grad-CAM 
+               heatmap, but warns the user that quality is poor.
+
+--------------------------------------------------------------------------------
+WINDOW 3: GOOD QUALITY / HIGH CONFIDENCE WINDOW
+Range:         0.30 to 1.00 (30% to 100%)
+System Status: PROCESSED, tagged as [good]
+Explanation:   The neural network has identified strong acoustic patterns (such as 
+               distinct high-frequency wheeze streaks or sharp crackle spikes). 
+               The prediction is processed with high confidence and tagged as [good].
+
+
+================================================================================
+3. SUMMARY TABLE FOR DEMO PRESENTATIONS
+================================================================================
+
+Confidence Score Range | Quality Status | Action Taken by EchoAssist
+-----------------------|----------------|-----------------------------------------
+< 0.15 (< 15%)         | Refused        | Gracefully declines prediction & asks to re-record
+0.15 – 0.30 (15%–30%)  | Poor Quality   | Displays prediction, Grad-CAM & warns poor signal
+0.30 – 1.00 (30%–100%) | Good Quality   | Full prediction, Grad-CAM, & high-confidence report
+================================================================================

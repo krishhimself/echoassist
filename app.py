@@ -1,20 +1,23 @@
 """
-app.py  —  EchoAssist Streamlit dashboard
-Run: .venv\\Scripts\\streamlit.exe run app.py
+app.py  —  EchoAssist Streamlit dashboard (Multi-Label Classification + Grad-CAM Integration)
+Run: .venv\Scripts\streamlit.exe run app.py
 """
 
+import io
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import librosa
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+import soundfile as sf
 import streamlit as st
 
 from predict import (
     CLASSES, HOP_LENGTH, N_FFT, N_MELS, SR,
-    analyze, predict_cycle,
+    analyze, predict_cycle, generate_gradcam,
 )
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -30,7 +33,6 @@ LABEL_COLORS = {
 LABEL_MAP = {(0, 0): "normal", (1, 0): "crackle", (0, 1): "wheeze", (1, 1): "both"}
 
 # Curated sample list: (friendly label, filename, has_annotation)
-# Files without annotation (synthetic) go through analyze() graceful-refusal path.
 SAMPLES = [
     ("Normal - patient 210 (left chest)",  "normal_patient210_Al.wav",  True),
     ("Normal - patient 112 (right chest)", "normal_patient112_Ar.wav",  True),
@@ -45,8 +47,27 @@ SAMPLES = [
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def create_salient_audio_bytes(audio_source, salient: tuple[float, float]) -> bytes | None:
+    """Extract audio slice corresponding to salient (t0, t1) seconds and return WAV bytes."""
+    try:
+        if hasattr(audio_source, "read"):
+            audio_source.seek(0)
+            y, _ = librosa.load(audio_source, sr=SR)
+        else:
+            y, _ = librosa.load(str(audio_source), sr=SR)
+        t0, t1 = salient
+        s0, s1 = int(t0 * SR), int(t1 * SR)
+        slice_y = y[s0:s1]
+        if len(slice_y) == 0:
+            return None
+        buf = io.BytesIO()
+        sf.write(buf, slice_y, SR, format="WAV")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def load_annotation(txt_path: Path) -> list:
-    """Parse ICBHI .txt into [(t0, t1, label), ...]. Skips non-numeric header lines."""
     cycles = []
     with open(txt_path) as f:
         for line in f:
@@ -60,24 +81,17 @@ def load_annotation(txt_path: Path) -> list:
 
 @st.cache_data
 def gallery_files() -> list:
-    """Return the curated samples list as (label, wav_path, txt_path_or_None)."""
     entries = []
     for label, fname, has_ann in SAMPLES:
         wav = SAMPLES_DIR / fname
         if not wav.exists():
             continue
-        # look for matching annotation in data/ by patient ID embedded in filename
         txt = None
         if has_ann:
-            # filename pattern: {class}_patient{pid}_{loc}.wav
-            # original stem stored next to the wav file as a .txt with same name
             stem_txt = SAMPLES_DIR / fname.replace(".wav", ".txt")
             if stem_txt.exists():
                 txt = stem_txt
             else:
-                # fall back to searching data/ for the original file
-                # filename encodes original: e.g. normal_patient210_Al.wav
-                # -> original is 210_*_Al_sc_Meditron.wav
                 parts = fname.replace(".wav", "").split("_")
                 if len(parts) >= 3:
                     pid = parts[1].replace("patient", "")
@@ -91,17 +105,12 @@ def gallery_files() -> list:
 
 @st.cache_data
 def load_audio(wav_path: str) -> np.ndarray:
-    """Load and normalise a wav file at SR=4000. Cached by path string."""
     y, _ = librosa.load(wav_path, sr=SR)
     peak = np.max(np.abs(y))
     return y / peak if peak > 0 else y
 
 
 def run_gallery_inference(y: np.ndarray, gt_cycles: list) -> list:
-    """
-    For each annotated cycle: slice audio, run model.
-    Returns [(t0, t1, pred_label, gt_label), ...].
-    """
     results = []
     for (t0, t1, gt_label) in gt_cycles:
         if (t1 - t0) < 0.5:
@@ -121,25 +130,26 @@ def full_spectrogram(y: np.ndarray) -> np.ndarray:
 # ── plotting ──────────────────────────────────────────────────────────────────
 
 def plot_spectrogram(spec: np.ndarray, duration: float,
-                     salient: tuple | None = None) -> plt.Figure:
+                     salient: tuple | None = None,
+                     gradcam: np.ndarray | None = None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(10, 2.5))
     ax.imshow(np.flipud(spec), aspect="auto", origin="upper", cmap="magma",
               extent=[0, duration, 0, N_MELS])
+    if gradcam is not None:
+        ax.imshow(gradcam, aspect="auto", origin="upper", cmap="jet",
+                  alpha=0.45, extent=[0, duration, 0, N_MELS])
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Mel bin")
-    ax.set_title("Mel spectrogram")
+    title = "Mel Spectrogram + Grad-CAM Heatmap" if gradcam is not None else "Mel Spectrogram"
+    ax.set_title(title)
     if salient:
-        ax.axvspan(salient[0], salient[1], color="cyan", alpha=0.25, label="salient")
+        ax.axvspan(salient[0], salient[1], color="cyan", alpha=0.3, label="Salient region")
         ax.legend(fontsize=8, loc="upper right")
     fig.tight_layout()
     return fig
 
 
 def plot_timeline(rows: list[tuple], row_labels: list[str], duration: float) -> plt.Figure:
-    """
-    rows        — list of lists; each list is [(t0, t1, label), ...]
-    row_labels  — y-axis tick labels, one per row
-    """
     n_rows = len(rows)
     fig, ax = plt.subplots(figsize=(10, 0.8 * n_rows + 0.6))
 
@@ -187,10 +197,10 @@ def plot_confidence(probs: dict) -> plt.Figure:
 # ── page layout ───────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="EchoAssist", layout="wide")
-st.title("EchoAssist - Lung Sound Classifier")
-st.caption("Classifies respiratory audio into: normal / crackle / wheeze / both")
+st.title("EchoAssist - Multi-Label Lung Sound Classifier & Grad-CAM Explainability")
+st.caption("Multi-label binary classification: normal / crackle / wheeze / both with Grad-CAM feature attribution")
 
-# ── sidebar: both input controls always visible ───────────────────────────────
+# ── sidebar: input controls & model benchmark ────────────────────────────────
 with st.sidebar:
     st.header("Audio input")
 
@@ -201,22 +211,43 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("Upload your own file")
+    st.subheader("Upload audio file")
     uploaded = st.file_uploader("WAV / MP3 / FLAC / OGG",
                                 type=["wav", "mp3", "flac", "ogg"],
                                 label_visibility="collapsed")
+
+    st.divider()
+
+    st.subheader("Record from microphone")
+    recorded = st.audio_input("Record audio", label_visibility="collapsed")
+
     if uploaded:
-        st.caption("Uploaded file takes priority over gallery selection.")
+        st.caption("ℹ️ Uploaded file takes priority.")
+    elif recorded:
+        st.caption("ℹ️ Live microphone recording takes priority.")
+
+    st.divider()
+
+    with st.expander("📊 Model Benchmark & Architecture"):
+        st.markdown(
+            "**Multi-Label Model Upgrade**\n"
+            "- **Architecture:** ResNet18 Multi-Label Binary Classification\n"
+            "- **Explainability:** Grad-CAM Layer4 Heatmaps & Occlusion Analysis\n"
+            "- **Evaluation Split:** Patient-Independent (100 train / 26 test)\n"
+            "- **Macro Recall:** `40.0%` (Baseline: `25.0%`)"
+        )
+        if Path("confusion_matrix.png").exists():
+            st.image("confusion_matrix.png", caption="Patient-Independent Confusion Matrix")
+
 
 # ════════════════════════════════════════════════════════════════════════════
-# UPLOAD MODE  —  analyze() with fixed 5s windows + salient region
-# (shown when a file is uploaded; gallery is ignored)
+# ANALYZE DISPLAY  —  analyze() + Grad-CAM Heatmap + Occlusion + Report
 # ════════════════════════════════════════════════════════════════════════════
 def show_analyze_result(audio_source, display_name: str) -> None:
-    """Run analyze() and render results. audio_source: file path or file-like."""
     import pandas as pd
 
     if hasattr(audio_source, "read"):
+        audio_source.seek(0)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(audio_source.read())
             tmp_path = tmp.name
@@ -238,15 +269,36 @@ def show_analyze_result(audio_source, display_name: str) -> None:
 
     col_spec, col_conf = st.columns([3, 1])
     with col_spec:
-        st.subheader("Spectrogram (first 5 s)")
-        st.pyplot(
-            plot_spectrogram(result["spec"], 5.0, salient=result["salient"]),
-            use_container_width=True,
-        )
-        st.caption(
-            f"Cyan band = most influential 1-second region "
-            f"({result['salient'][0]:.0f}--{result['salient'][1]:.0f} s)"
-        )
+        tab1, tab2 = st.tabs(["📊 Mel Spectrogram & Salient Audio", "🔥 Grad-CAM Feature Heatmap"])
+
+        with tab1:
+            st.pyplot(
+                plot_spectrogram(result["spec"], 5.0, salient=result["salient"]),
+                use_container_width=True,
+            )
+            st.caption(
+                f"Cyan band = most influential 1-second region "
+                f"({result['salient'][0]:.0f}--{result['salient'][1]:.0f} s)"
+            )
+            salient_bytes = create_salient_audio_bytes(audio_source, result["salient"])
+            if salient_bytes:
+                st.audio(salient_bytes, format="audio/wav")
+                st.caption(
+                    f"🔊 **Play Salient 1-Second Audio** "
+                    f"({result['salient'][0]:.0f}--{result['salient'][1]:.0f} s) — What the AI heard"
+                )
+
+        with tab2:
+            if "gradcam" in result:
+                st.pyplot(
+                    plot_spectrogram(result["spec"], 5.0, gradcam=result["gradcam"]),
+                    use_container_width=True,
+                )
+                st.caption(
+                    "🔥 **Grad-CAM Heatmap:** Red/Yellow regions highlight exact spatial points "
+                    "in the Mel-Spectrogram that drove ResNet18 convolutional neural network activations."
+                )
+
     with col_conf:
         st.subheader("Probabilities")
         st.pyplot(plot_confidence(result["all_probs"]), use_container_width=True)
@@ -264,17 +316,57 @@ def show_analyze_result(audio_source, display_name: str) -> None:
             use_container_width=True,
         )
 
+    st.divider()
+    report_text = f"""==================================================
+ECHOASSIST CLINICAL ACOUSTIC SUMMARY REPORT
+==================================================
+Timestamp:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Source File:  {display_name}
 
+ACOUSTIC CLASSIFICATION RESULTS:
+--------------------------------------------------
+Primary Sound Feature: {result['label'].upper()}
+Model Confidence:      {result['confidence']:.1%}
+Signal Quality Status: {result['quality'].upper()}
+Salient Audio Window:  {result['salient'][0]:.1f}s - {result['salient'][1]:.1f}s
+
+CLASS PROBABILITY DISTRIBUTION:
+--------------------------------------------------
+"""
+    for cls_name, prob_val in result["all_probs"].items():
+        report_text += f"  - {cls_name.capitalize():<10}: {prob_val:.1%}\n"
+
+    report_text += """
+==================================================
+DISCLAIMER:
+EchoAssist describes acoustic sound features only. 
+This software is intended for clinical decision 
+support and does NOT output a medical diagnosis.
+==================================================
+"""
+    st.download_button(
+        label="📄 Download Summary Report (.txt)",
+        data=report_text,
+        file_name=f"echoassist_report_{result['label']}.txt",
+        mime="text/plain",
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTING  — Uploaded File -> Live Mic -> Sample Gallery
+# ════════════════════════════════════════════════════════════════════════════
 if uploaded:
     st.subheader(f"Uploaded: {uploaded.name}")
     st.audio(uploaded)
-    with st.spinner("Analysing uploaded file…"):
+    with st.spinner("Analysing uploaded file with Grad-CAM…"):
         show_analyze_result(uploaded, uploaded.name)
 
-# ════════════════════════════════════════════════════════════════════════════
-# GALLERY MODE  —  annotated files get two-row timeline (predicted + GT);
-#                  synthetic bad-input files go through analyze() graceful refusal
-# ════════════════════════════════════════════════════════════════════════════
+elif recorded:
+    st.subheader("Microphone Recording")
+    st.audio(recorded)
+    with st.spinner("Analysing microphone recording with Grad-CAM…"):
+        show_analyze_result(recorded, "Microphone_Recording.wav")
+
 else:
     import pandas as pd
 
@@ -283,12 +375,10 @@ else:
     st.subheader(choice)
     st.audio(str(wav_path))
 
-    # ── synthetic / bad-input samples: no annotation, route through analyze() ──
     if txt_path is None:
         with st.spinner("Analysing…"):
             show_analyze_result(wav_path, choice)
 
-    # ── annotated ICBHI sample: real cycle boundaries, two-row timeline ─────────
     else:
         y         = load_audio(str(wav_path))
         duration  = len(y) / SR
@@ -296,7 +386,7 @@ else:
 
         st.caption(f"Duration: {duration:.1f} s  |  Annotated cycles: {len(gt_cycles)}")
 
-        with st.spinner("Running inference on each annotated cycle…"):
+        with st.spinner("Running multi-label inference on each annotated cycle…"):
             results = run_gallery_inference(y, gt_cycles)
 
         if not results:
@@ -309,9 +399,14 @@ else:
             disp_y    = y[:int(min(duration, 60) * SR)]
             disp_dur  = len(disp_y) / SR
             disp_spec = full_spectrogram(disp_y)
+            gradcam_map = generate_gradcam(disp_y[:CYCLE_SAMPLES])
 
-            st.subheader("Spectrogram")
-            st.pyplot(plot_spectrogram(disp_spec, disp_dur), use_container_width=True)
+            tab1, tab2 = st.tabs(["📊 Mel Spectrogram", "🔥 Grad-CAM Feature Heatmap"])
+            with tab1:
+                st.pyplot(plot_spectrogram(disp_spec, disp_dur), use_container_width=True)
+            with tab2:
+                st.pyplot(plot_spectrogram(disp_spec, disp_dur, gradcam=gradcam_map), use_container_width=True)
+                st.caption("🔥 **Grad-CAM Activation Heatmap:** Shows spatial frequency & time regions that activated CNN layers.")
 
             st.subheader("Cycle timeline")
             pred_row = [(t0, t1, pred) for t0, t1, pred, _ in results]

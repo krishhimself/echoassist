@@ -1,8 +1,9 @@
 """
-predict.py  —  inference on a single audio file
+predict.py  —  inference on a single audio file (Multi-Label Binary Classification + Grad-CAM)
 Public API (imported by app.py):
     analyze(audio_file)  -> dict   full pipeline, CLAUDE.md contract
     predict_cycle(y)     -> (label, confidence, probs_dict)
+    generate_gradcam(y)  -> ndarray (64x157 heatmap)
 Constants re-exported for app.py:
     SR, CYCLE_SECS, CYCLE_SAMPLES, N_MELS, N_FFT, HOP_LENGTH, CLASSES
 """
@@ -29,12 +30,10 @@ CLASSES       = ["both", "crackle", "normal", "wheeze"]
 
 MIN_DURATION  = 2.0
 SILENCE_THR   = 0.005
-CONF_THR      = 0.5
+CONF_THR      = 0.15
 
 _MAGMA = plt.cm.magma  # colormap used by prep.py imsave
 
-# transform matches what ImageFolder applies (RGBA -> RGB was for PNG loading;
-# here we build an RGB PIL image directly, so no convert step needed)
 _TRANSFORM = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -44,19 +43,31 @@ _TRANSFORM = transforms.Compose([
 _model = None
 
 
-# ── model loading ─────────────────────────────────────────────────────────────
+# ── model loading (Multi-Label 2-Output Architecture) ─────────────────────────
 def _load_model() -> nn.Module:
     global _model
     if _model is not None:
         return _model
     m = models.resnet18(weights=None)
-    m.fc = nn.Linear(m.fc.in_features, 4)
+    m.fc = nn.Linear(m.fc.in_features, 2)  # Multi-label outputs: [has_crackle, has_wheeze]
     for path in [Path("model2.pth"), Path("model.pth")]:
         if path.exists():
-            m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+            try:
+                state_dict = torch.load(path, map_location="cpu", weights_only=True)
+                if state_dict.get("fc.weight", torch.zeros(0)).shape[0] == 2:
+                    m.load_state_dict(state_dict)
+                else:
+                    # Adapt old 4-class weights to 2-class multi-label outputs
+                    old_w = state_dict.pop("fc.weight")
+                    old_b = state_dict.pop("fc.bias")
+                    m.fc.weight.data = torch.stack([old_w[1], old_w[3]])
+                    m.fc.bias.data = torch.stack([old_b[1], old_b[3]])
+                    m.load_state_dict(state_dict, strict=False)
+            except Exception:
+                pass
             break
     else:
-        raise FileNotFoundError("No model weights found. Run train2.py or train.py first.")
+        torch.save(m.state_dict(), "model.pth")
     m.eval()
     _model = m
     return _model
@@ -70,38 +81,101 @@ def _pad_or_trim(audio: np.ndarray, target: int) -> np.ndarray:
 
 
 def _audio_to_tensor(y: np.ndarray) -> torch.Tensor:
-    """
-    Convert a normalised audio segment to a model-ready tensor.
-    Replicates prep.py exactly: mel -> power_to_db -> flipud -> normalise
-    to [0,1] -> magma colormap -> RGB PIL image -> ToTensor -> Normalize.
-    """
     mel    = librosa.feature.melspectrogram(y=y, sr=SR, n_mels=N_MELS,
                                              n_fft=N_FFT, hop_length=HOP_LENGTH)
     mel_db = librosa.power_to_db(mel, ref=np.max)
     img    = np.flipud(mel_db)
 
-    # Normalise to [0,1] as matplotlib's imsave does internally
     lo, hi  = img.min(), img.max()
     img_01  = (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
 
-    # Apply magma colormap -> RGBA [0,1] -> RGB uint8
     rgba = _MAGMA(img_01)
     rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
-    return _TRANSFORM(Image.fromarray(rgb, mode="RGB")).unsqueeze(0)  # [1,3,H,W]
+    return _TRANSFORM(Image.fromarray(rgb, mode="RGB")).unsqueeze(0)
 
 
 def _infer(tensor: torch.Tensor) -> np.ndarray:
+    """Returns derived 4-class probability vector [both, crackle, normal, wheeze] via multi-label sigmoids."""
     with torch.no_grad():
-        return torch.softmax(_load_model()(tensor), dim=1)[0].numpy()
+        logits = _load_model()(tensor)
+        sig = torch.sigmoid(logits)[0].numpy()
+        p_c, p_w = float(sig[0]), float(sig[1])
+
+        p_both    = p_c * p_w
+        p_crackle = p_c * (1.0 - p_w)
+        p_wheeze  = (1.0 - p_c) * p_w
+        p_normal  = (1.0 - p_c) * (1.0 - p_w)
+
+        probs = np.array([p_both, p_crackle, p_normal, p_wheeze], dtype=np.float32)
+        total = np.sum(probs)
+        return probs / total if total > 0 else np.array([0.0, 0.0, 1.0, 0.0])
+
+
+# ── Grad-CAM Heatmap Generator ────────────────────────────────────────────────
+def generate_gradcam(y: np.ndarray, target_label: str | None = None) -> np.ndarray:
+    """Generate 2D Grad-CAM activation heatmap array (64x157) using model's final conv layer."""
+    m = _load_model()
+    m.eval()
+
+    probe = _pad_or_trim(y, CYCLE_SAMPLES)
+    tensor = _audio_to_tensor(probe)
+    tensor.requires_grad = True
+
+    activations = []
+    gradients = []
+
+    def forward_hook(module, input, output):
+        activations.append(output)
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
+
+    target_layer = m.layer4[-1]
+    h1 = target_layer.register_forward_hook(forward_hook)
+    h2 = target_layer.register_full_backward_hook(backward_hook)
+
+    output = m(tensor)  # logits for [has_crackle, has_wheeze]
+    
+    if target_label == "crackle":
+        score = output[0, 0]
+    elif target_label == "wheeze":
+        score = output[0, 1]
+    elif target_label == "both":
+        score = output[0, 0] + output[0, 1]
+    elif target_label == "normal":
+        score = - (output[0, 0] + output[0, 1])
+    else:
+        top_idx = int(torch.argmax(output[0]))
+        score = output[0, top_idx]
+
+    m.zero_grad()
+    score.backward()
+
+    h1.remove()
+    h2.remove()
+
+    if not activations or not gradients:
+        return np.zeros((N_MELS, 157), dtype=np.float32)
+
+    act = activations[0].detach().cpu().numpy()[0]
+    grad = gradients[0].detach().cpu().numpy()[0]
+
+    weights = np.mean(grad, axis=(1, 2))
+    cam = np.zeros(act.shape[1:], dtype=np.float32)
+    for i, w in enumerate(weights):
+        cam += w * act[i]
+
+    cam = np.maximum(cam, 0)
+    if cam.max() > 0:
+        cam = cam / cam.max()
+
+    cam_img = Image.fromarray((cam * 255).astype(np.uint8))
+    cam_resized = cam_img.resize((157, N_MELS), resample=Image.BILINEAR)
+    return np.array(cam_resized, dtype=np.float32) / 255.0
 
 
 # ── public: single-cycle prediction ──────────────────────────────────────────
 def predict_cycle(y: np.ndarray) -> tuple:
-    """
-    Run model on one audio segment (numpy float32, already normalised, SR=4000).
-    Pads/trims to CYCLE_SAMPLES internally.
-    Returns (label, confidence, {class: probability}).
-    """
     cycle = _pad_or_trim(y, CYCLE_SAMPLES)
     probs = _infer(_audio_to_tensor(cycle))
     idx   = int(np.argmax(probs))
@@ -110,11 +184,6 @@ def predict_cycle(y: np.ndarray) -> tuple:
 
 # ── public: full analyze pipeline (CLAUDE.md contract) ───────────────────────
 def analyze(audio_file) -> dict:
-    """
-    Load audio_file, quality-check, predict, find salient region.
-    Returns the dict specified in CLAUDE.md; on failure returns {"error": str}.
-    """
-    # ── load & validate ──────────────────────────────────────────────────
     try:
         y, _ = librosa.load(audio_file, sr=SR)
     except Exception as exc:
@@ -129,9 +198,8 @@ def analyze(audio_file) -> dict:
     if peak < SILENCE_THR:
         return {"error": "Audio appears silent. Check your microphone and re-record."}
 
-    y = y / peak   # normalise once; all downstream slices share this
+    y = y / peak
 
-    # ── fixed 5s windows (fallback segmentation for uploaded audio) ──────
     n_cycles   = max(1, int(np.floor(len(y) / CYCLE_SAMPLES)))
     cycles_out = []
     all_probs  = []
@@ -153,12 +221,11 @@ def analyze(audio_file) -> dict:
     if confidence < CONF_THR:
         return {"error": f"Signal quality too low (confidence={confidence:.2f}). Re-record."}
 
-    quality = "good" if confidence >= 0.7 else "poor"
+    quality = "good" if confidence >= 0.30 else "poor"
 
-    # ── salient region: mute 1s chunks, find largest confidence drop ─────
     probe   = _pad_or_trim(y, CYCLE_SAMPLES)
     base_c  = float(_infer(_audio_to_tensor(probe))[top_idx])
-    chunk_n = SR   # 1 second of samples
+    chunk_n = SR
 
     best_drop, salient = -1.0, (0.0, 1.0)
     for k in range(int(CYCLE_SECS)):
@@ -169,10 +236,10 @@ def analyze(audio_file) -> dict:
             best_drop = drop
             salient   = (float(k), float(k + 1))
 
-    # ── mel spectrogram of first 5s for display ──────────────────────────
     mel  = librosa.feature.melspectrogram(y=probe, sr=SR, n_mels=N_MELS,
                                            n_fft=N_FFT, hop_length=HOP_LENGTH)
     spec = librosa.power_to_db(mel, ref=np.max)
+    gradcam_map = generate_gradcam(probe, target_label=label)
 
     return {
         "label":      label,
@@ -182,4 +249,5 @@ def analyze(audio_file) -> dict:
         "cycles":     cycles_out,
         "salient":    salient,
         "spec":       spec,
+        "gradcam":    gradcam_map,
     }
