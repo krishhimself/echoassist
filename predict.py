@@ -1,33 +1,65 @@
 """
 predict.py  —  analyze() contract for app.py
 
-STUB: label / confidence / all_probs / cycles / salient are hardcoded
-plausible values. No model.pth is loaded yet — this exists so app.py
-can be built against a stable interface. Audio loading, the quality
-gate, and the spectrogram are real (librosa), since those don't need
-a trained model and app.py needs something real to display.
+Loads model.pth (ResNet18, trained on 5-second-cycle mel spectrograms —
+see prep.py / train.py) and runs real inference. The audio is chopped
+into 5-second windows (same CYCLE_SECS as prep.py), each windowed
+spectrogram is rendered through matplotlib's magma colormap exactly the
+way prep.py wrote the training PNGs (per-window min/max normalization),
+then classified. Per-window predictions become the cycle timeline;
+their mean becomes the overall label/confidence.
 
 Usage:
   .venv\\Scripts\\python.exe predict.py path\\to\\file.wav
 """
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import librosa
+import matplotlib
+import matplotlib.colors as mcolors
+import torch
+from torchvision import models, transforms
 
-# ── constants — MUST match prep.py exactly ─────────────────────────────────
-SR          = 4000
-N_MELS      = 64
-N_FFT       = 512
-HOP_LENGTH  = 128
+# ── constants — MUST match prep.py / train.py exactly ───────────────────────
+SR            = 4000
+N_MELS        = 64
+N_FFT         = 512
+HOP_LENGTH    = 128
+CYCLE_SECS    = 5.0
+CYCLE_SAMPLES = int(SR * CYCLE_SECS)  # 20 000 samples, matches prep.py
 
 MIN_DURATION_SECS   = 2.0
 MIN_MEAN_ABS_AMP    = 0.005
 MIN_TOP_CONFIDENCE  = 0.5
 
+MODEL_PATH = Path("model.pth")
+
+# ImageFolder sorts class dirs alphabetically — this is the model's output order
+MODEL_CLASSES = ["both", "crackle", "normal", "wheeze"]
+# display / dict order used throughout the rest of the app
 CLASSES = ["normal", "crackle", "wheeze", "both"]
+
+_transform = transforms.Compose([
+    transforms.Lambda(lambda img: img.convert("RGB")),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                          std=[0.229, 0.224, 0.225]),
+])
+
+
+# ── model loading (once, cached) ─────────────────────────────────────────────
+@lru_cache(maxsize=1)
+def _load_model():
+    model = models.resnet18(weights=None)
+    model.fc = torch.nn.Linear(model.fc.in_features, len(MODEL_CLASSES))
+    state = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+    return model
 
 
 def _empty_result(quality: str, message: str) -> dict:
@@ -43,10 +75,33 @@ def _empty_result(quality: str, message: str) -> dict:
     }
 
 
+def _pad_or_trim(audio: np.ndarray, target: int) -> np.ndarray:
+    if len(audio) >= target:
+        return audio[:target]
+    return np.concatenate([audio, np.zeros(target - len(audio), dtype=audio.dtype)])
+
+
+def _mel_db_to_rgb(mel_db_flipped: np.ndarray) -> np.ndarray:
+    """Reproduce mpimg.imsave(..., cmap='magma') exactly: per-array min/max
+    normalization through the magma colormap, dropping alpha. This is the
+    same pixel data the model was trained on."""
+    norm = mcolors.Normalize(vmin=mel_db_flipped.min(), vmax=mel_db_flipped.max())
+    rgba = matplotlib.colormaps["magma"](norm(mel_db_flipped))
+    return (rgba[..., :3] * 255).astype(np.uint8)
+
+
+def _window_spec(cycle_audio: np.ndarray) -> np.ndarray:
+    mel = librosa.feature.melspectrogram(
+        y=cycle_audio, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    return np.flipud(mel_db)
+
+
 def analyze(audio_file) -> dict:
     """
     Classify a respiratory audio file. Never raises — unusable audio
-    is reported back via quality="poor" + a message, not an exception.
+    or a missing model is reported back via quality="poor" + a message.
     """
     # ── load ─────────────────────────────────────────────────────────────
     try:
@@ -70,42 +125,55 @@ def analyze(audio_file) -> dict:
     if mean_abs_amp < MIN_MEAN_ABS_AMP:
         return _empty_result("poor", "signal too quiet - looks like silence, re-record")
 
+    try:
+        model = _load_model()
+    except Exception as exc:
+        return _empty_result("poor", f"model unavailable: {exc}")
+
     # ── normalize (same as prep.py) ─────────────────────────────────────
     peak = np.max(np.abs(y))
     if peak > 0:
         y = y / peak
 
-    # ── real mel spectrogram, same params as prep.py ────────────────────
-    mel = librosa.feature.melspectrogram(
-        y=y, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    spec = np.flipud(mel_db)
+    # ── full-clip mel spectrogram, only for display in app.py ──────────
+    spec = _window_spec(y)
 
-    # ── HARDCODED classification (no model loaded yet) ─────────────────
-    label = "crackle"
-    all_probs = {
-        "normal": 0.12,
-        "crackle": 0.61,
-        "wheeze": 0.19,
-        "both": 0.08,
-    }
+    # ── chop into 5-second windows (proxy for breath cycles) and classify ─
+    window_starts = np.arange(0.0, duration, CYCLE_SECS)
+    window_specs = []
+    window_bounds = []
+    for w_start in window_starts:
+        s0 = int(w_start * SR)
+        s1 = s0 + CYCLE_SAMPLES
+        window_audio = _pad_or_trim(y[s0:s1], CYCLE_SAMPLES)
+        window_specs.append(_mel_db_to_rgb(_window_spec(window_audio)))
+        window_bounds.append((float(w_start), float(min(w_start + CYCLE_SECS, duration))))
+
+    batch = torch.stack([_transform(_to_pil(w)) for w in window_specs])
+
+    with torch.no_grad():
+        logits = model(batch)
+        probs = torch.softmax(logits, dim=1).numpy()  # (n_windows, 4), MODEL_CLASSES order
+
+    # ── per-window cycle labels ──────────────────────────────────────────
+    cycles = []
+    for (w0, w1), p in zip(window_bounds, probs):
+        cyc_label = MODEL_CLASSES[int(np.argmax(p))]
+        cycles.append((w0, w1, cyc_label))
+
+    # ── overall prediction = mean probability across windows ────────────
+    mean_probs = probs.mean(axis=0)
+    all_probs = {cls: float(mean_probs[i]) for i, cls in enumerate(MODEL_CLASSES)}
+    label = max(all_probs, key=all_probs.get)
     confidence = all_probs[label]
 
     if confidence < MIN_TOP_CONFIDENCE:
         return _empty_result("poor", "signal quality too low, re-record")
 
-    # ── hardcoded breath-cycle timeline, spaced across the real duration ─
-    cycle_labels = ["normal", "crackle", "crackle", "normal"]
-    n_cycles = max(1, min(4, int(duration // 2.5) or 1))
-    edges = np.linspace(0, duration, n_cycles + 1)
-    cycles = [
-        (float(edges[i]), float(edges[i + 1]), cycle_labels[i % len(cycle_labels)])
-        for i in range(n_cycles)
-    ]
-
-    # ── hardcoded salient region — middle third of the recording ────────
-    salient = (float(duration / 3), float(2 * duration / 3))
+    # ── salient region = the window that most supports the overall label ─
+    label_idx = MODEL_CLASSES.index(label)
+    best_window = int(np.argmax(probs[:, label_idx]))
+    salient = window_bounds[best_window]
 
     return {
         "label": label,
@@ -117,6 +185,11 @@ def analyze(audio_file) -> dict:
         "spec": spec,
         "message": None,
     }
+
+
+def _to_pil(rgb_array: np.ndarray):
+    from PIL import Image
+    return Image.fromarray(rgb_array, mode="RGB")
 
 
 if __name__ == "__main__":
