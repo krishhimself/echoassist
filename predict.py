@@ -9,6 +9,12 @@ way prep.py wrote the training PNGs (per-window min/max normalization),
 then classified. Per-window predictions become the cycle timeline;
 their mean becomes the overall label/confidence.
 
+Explainability (salient region) is occlusion-based: the audio is split
+into 1-second chunks, each is muted in turn, the whole pipeline is
+re-run, and the chunk whose removal causes the largest confidence drop
+for the predicted class is reported as salient. A plain loop, no
+Grad-CAM.
+
 Usage:
   .venv\\Scripts\\python.exe predict.py path\\to\\file.wav
 """
@@ -35,6 +41,8 @@ CYCLE_SAMPLES = int(SR * CYCLE_SECS)  # 20 000 samples, matches prep.py
 MIN_DURATION_SECS   = 2.0
 MIN_MEAN_ABS_AMP    = 0.005
 MIN_TOP_CONFIDENCE  = 0.5
+
+OCCLUSION_CHUNK_SECS = 1.0  # explainability: mute-one-second-at-a-time
 
 MODEL_PATH = Path("model.pth")
 
@@ -98,6 +106,23 @@ def _window_spec(cycle_audio: np.ndarray) -> np.ndarray:
     return np.flipud(mel_db)
 
 
+def _predict_probs(model, y: np.ndarray, window_bounds: list) -> np.ndarray:
+    """Run the model over each 5s window of y. Returns (n_windows, 4) softmax
+    probabilities in MODEL_CLASSES order."""
+    specs = []
+    for w0, _w1 in window_bounds:
+        s0 = int(w0 * SR)
+        s1 = s0 + CYCLE_SAMPLES
+        window_audio = _pad_or_trim(y[s0:s1], CYCLE_SAMPLES)
+        specs.append(_mel_db_to_rgb(_window_spec(window_audio)))
+
+    batch = torch.stack([_transform(_to_pil(s)) for s in specs])
+    with torch.no_grad():
+        logits = model(batch)
+        probs = torch.softmax(logits, dim=1).numpy()
+    return probs
+
+
 def analyze(audio_file) -> dict:
     """
     Classify a respiratory audio file. Never raises — unusable audio
@@ -140,20 +165,12 @@ def analyze(audio_file) -> dict:
 
     # ── chop into 5-second windows (proxy for breath cycles) and classify ─
     window_starts = np.arange(0.0, duration, CYCLE_SECS)
-    window_specs = []
-    window_bounds = []
-    for w_start in window_starts:
-        s0 = int(w_start * SR)
-        s1 = s0 + CYCLE_SAMPLES
-        window_audio = _pad_or_trim(y[s0:s1], CYCLE_SAMPLES)
-        window_specs.append(_mel_db_to_rgb(_window_spec(window_audio)))
-        window_bounds.append((float(w_start), float(min(w_start + CYCLE_SECS, duration))))
+    window_bounds = [
+        (float(w_start), float(min(w_start + CYCLE_SECS, duration)))
+        for w_start in window_starts
+    ]
 
-    batch = torch.stack([_transform(_to_pil(w)) for w in window_specs])
-
-    with torch.no_grad():
-        logits = model(batch)
-        probs = torch.softmax(logits, dim=1).numpy()  # (n_windows, 4), MODEL_CLASSES order
+    probs = _predict_probs(model, y, window_bounds)  # (n_windows, 4), MODEL_CLASSES order
 
     # ── per-window cycle labels ──────────────────────────────────────────
     cycles = []
@@ -170,10 +187,23 @@ def analyze(audio_file) -> dict:
     if confidence < MIN_TOP_CONFIDENCE:
         return _empty_result("poor", "signal quality too low, re-record")
 
-    # ── salient region = the window that most supports the overall label ─
+    # ── occlusion explainability: mute 1s chunks, find the biggest drop ──
     label_idx = MODEL_CLASSES.index(label)
-    best_window = int(np.argmax(probs[:, label_idx]))
-    salient = window_bounds[best_window]
+    n_chunks = int(np.ceil(duration / OCCLUSION_CHUNK_SECS))
+    salient = (0.0, min(OCCLUSION_CHUNK_SECS, duration))
+    best_drop = -np.inf
+    for i in range(n_chunks):
+        c0 = i * OCCLUSION_CHUNK_SECS
+        c1 = min(c0 + OCCLUSION_CHUNK_SECS, duration)
+        y_muted = y.copy()
+        y_muted[int(c0 * SR):int(c1 * SR)] = 0.0
+
+        muted_probs = _predict_probs(model, y_muted, window_bounds).mean(axis=0)
+        drop = confidence - float(muted_probs[label_idx])
+
+        if drop > best_drop:
+            best_drop = drop
+            salient = (c0, c1)
 
     return {
         "label": label,
