@@ -1,0 +1,5 @@
+﻿data/
+spectrograms/
+*.pth
+__pycache__/
+.venv/
