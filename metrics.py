@@ -1,92 +1,141 @@
 """
-metrics.py  —  confusion matrix + per-class precision/recall/F1 on the test set
-
-Usage:
-  .venv\\Scripts\\python.exe metrics.py
+metrics.py  --  evaluate model2.pth on the held-out test set
+Outputs:
+    confusion_matrix.png   heat-map with counts
+    metrics_bar.png        per-class precision / recall / F1 bar chart
+Run: .venv\\Scripts\\python.exe metrics.py
 """
 
 from pathlib import Path
-
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets
-from sklearn.metrics import confusion_matrix, classification_report
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, models, transforms
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    precision_recall_fscore_support,
+)
 
-from train import make_model, _transform, SPEC_DIR, MODEL_PATH
+SPEC_DIR   = Path("spectrograms")
+MODEL_PATH = Path("model2.pth")
+BATCH_SIZE = 64
+CLASSES    = ["both", "crackle", "normal", "wheeze"]
 
-BATCH_SIZE = 32
-OUT_DIR    = Path("metrics_out")
+_transform = transforms.Compose([
+    transforms.Lambda(lambda img: img.convert("RGB")),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
 
 
-def evaluate_test_set():
-    device = torch.device("cpu")
-    test_ds     = datasets.ImageFolder(SPEC_DIR / "test", transform=_transform)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    classes = test_ds.classes
+def load_model() -> nn.Module:
+    m = models.resnet18(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, 4)
+    m.load_state_dict(torch.load(MODEL_PATH, map_location="cpu", weights_only=True))
+    m.eval()
+    return m
 
-    model = make_model().to(device)
-    state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
 
+def get_predictions(model, loader):
     all_preds, all_labels = [], []
     with torch.no_grad():
-        for imgs, labels in test_loader:
-            preds = model(imgs.to(device)).argmax(dim=1).cpu().tolist()
-            all_preds.extend(preds)
+        for imgs, labels in loader:
+            all_preds.extend(model(imgs).argmax(dim=1).tolist())
             all_labels.extend(labels.tolist())
+    return np.array(all_labels), np.array(all_preds)
 
-    return np.array(all_labels), np.array(all_preds), classes
 
+def plot_confusion_matrix(y_true, y_pred, save_path: Path) -> None:
+    cm     = confusion_matrix(y_true, y_pred, labels=list(range(len(CLASSES))))
+    cm_pct = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
 
-def plot_confusion_matrix(cm: np.ndarray, classes: list[str], out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(5, 5))
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(len(classes)))
-    ax.set_xticklabels(classes, rotation=45, ha="right")
-    ax.set_yticks(range(len(classes)))
-    ax.set_yticklabels(classes)
-    ax.set_xlabel("predicted")
-    ax.set_ylabel("true")
-    thresh = cm.max() / 2
-    for i in range(len(classes)):
-        for j in range(len(classes)):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                     color="white" if cm[i, j] > thresh else "black")
-    fig.colorbar(im, ax=ax)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm_pct, cmap="Blues", vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, fraction=0.046)
+
+    ax.set_xticks(range(len(CLASSES)))
+    ax.set_yticks(range(len(CLASSES)))
+    ax.set_xticklabels(CLASSES, rotation=35, ha="right")
+    ax.set_yticklabels(CLASSES)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix (row-normalised %)")
+
+    thresh = 0.5
+    for i in range(len(CLASSES)):
+        for j in range(len(CLASSES)):
+            ax.text(j, i, f"{cm[i,j]}\n({cm_pct[i,j]:.0%})",
+                    ha="center", va="center", fontsize=9,
+                    color="white" if cm_pct[i, j] > thresh else "black")
+
     fig.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
+    print(f"Saved: {save_path}")
+
+
+def plot_metrics_bar(precision, recall, f1, save_path: Path) -> None:
+    x     = np.arange(len(CLASSES))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(x - width, precision, width, label="Precision", color="#2196F3", alpha=0.9)
+    ax.bar(x,         recall,    width, label="Recall",    color="#4CAF50", alpha=0.9)
+    ax.bar(x + width, f1,        width, label="F1",        color="#FF9800", alpha=0.9)
+
+    for bars, vals in [(x - width, precision), (x, recall), (x + width, f1)]:
+        for bx, v in zip(bars, vals):
+            ax.text(bx, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(CLASSES)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("Score")
+    ax.set_title("Per-class Precision / Recall / F1  (model2.pth, test set)")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {save_path}")
 
 
 def main() -> None:
-    OUT_DIR.mkdir(exist_ok=True)
+    test_ds = datasets.ImageFolder(SPEC_DIR / "test", transform=_transform)
+    loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    y_true, y_pred, classes = evaluate_test_set()
-    n = len(classes)
-
-    cm     = confusion_matrix(y_true, y_pred, labels=list(range(n)))
-    report = classification_report(y_true, y_pred, target_names=classes,
-                                    digits=3, zero_division=0)
-
-    print(f"Test set size: {len(y_true)}")
-    print(f"Classes: {classes}\n")
-
-    print("Confusion matrix (rows=true, cols=predicted):")
-    print("        " + "  ".join(f"{c:>8}" for c in classes))
-    for i, row in enumerate(cm):
-        print(f"{classes[i]:>8}  " + "  ".join(f"{v:>8}" for v in row))
+    print(f"Test samples : {len(test_ds)}")
+    print(f"Model        : {MODEL_PATH}")
     print()
 
-    print(report)
+    model          = load_model()
+    y_true, y_pred = get_predictions(model, loader)
 
-    plot_path = OUT_DIR / "confusion_matrix.png"
-    plot_confusion_matrix(cm, classes, plot_path)
-    print(f"Saved confusion matrix plot -> {plot_path}")
+    acc = (y_true == y_pred).mean()
+    print(f"Overall accuracy : {acc:.3f}\n")
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=list(range(len(CLASSES))), zero_division=0
+    )
+
+    print(f"{'class':<10} {'prec':>7} {'rec':>7} {'f1':>7} {'support':>9}")
+    print("-" * 46)
+    for i, cls in enumerate(CLASSES):
+        print(f"{cls:<10} {precision[i]:>7.3f} {recall[i]:>7.3f} "
+              f"{f1[i]:>7.3f} {int(support[i]):>9}")
+    print("-" * 46)
+    print(f"{'macro':<10} {precision.mean():>7.3f} {recall.mean():>7.3f} "
+          f"{f1.mean():>7.3f} {int(support.sum()):>9}")
+
+    print("\n--- sklearn classification_report ---")
+    print(classification_report(y_true, y_pred, target_names=CLASSES, zero_division=0))
+
+    plot_confusion_matrix(y_true, y_pred, Path("confusion_matrix.png"))
+    plot_metrics_bar(precision, recall, f1, Path("metrics_bar.png"))
 
 
 if __name__ == "__main__":

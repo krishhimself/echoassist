@@ -1,243 +1,185 @@
 """
-predict.py  —  analyze() contract for app.py
-
-Loads model.pth (ResNet18, trained on 5-second-cycle mel spectrograms —
-see prep.py / train.py) and runs real inference. The audio is chopped
-into 5-second windows (same CYCLE_SECS as prep.py), each windowed
-spectrogram is rendered through matplotlib's magma colormap exactly the
-way prep.py wrote the training PNGs (per-window min/max normalization),
-then classified. Per-window predictions become the cycle timeline;
-their mean becomes the overall label/confidence.
-
-Explainability (salient region) is occlusion-based: the audio is split
-into 1-second chunks, each is muted in turn, the whole pipeline is
-re-run, and the chunk whose removal causes the largest confidence drop
-for the predicted class is reported as salient. A plain loop, no
-Grad-CAM.
-
-Usage:
-  .venv\\Scripts\\python.exe predict.py path\\to\\file.wav
+predict.py  —  inference on a single audio file
+Public API (imported by app.py):
+    analyze(audio_file)  -> dict   full pipeline, CLAUDE.md contract
+    predict_cycle(y)     -> (label, confidence, probs_dict)
+Constants re-exported for app.py:
+    SR, CYCLE_SECS, CYCLE_SAMPLES, N_MELS, N_FFT, HOP_LENGTH, CLASSES
 """
 
-import sys
-from functools import lru_cache
 from pathlib import Path
-
 import numpy as np
 import librosa
 import matplotlib
-import matplotlib.colors as mcolors
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 from torchvision import models, transforms
+from PIL import Image
 
-# ── constants — MUST match prep.py / train.py exactly ───────────────────────
+# ── constants (must match prep.py exactly) ───────────────────────────────────
 SR            = 4000
+CYCLE_SECS    = 5.0
+CYCLE_SAMPLES = int(SR * CYCLE_SECS)   # 20 000
 N_MELS        = 64
 N_FFT         = 512
 HOP_LENGTH    = 128
-CYCLE_SECS    = 5.0
-CYCLE_SAMPLES = int(SR * CYCLE_SECS)  # 20 000 samples, matches prep.py
+CLASSES       = ["both", "crackle", "normal", "wheeze"]
 
-MIN_DURATION_SECS   = 2.0
-MIN_MEAN_ABS_AMP    = 0.005
-MIN_TOP_CONFIDENCE  = 0.5
+MIN_DURATION  = 2.0
+SILENCE_THR   = 0.005
+CONF_THR      = 0.5
 
-OCCLUSION_CHUNK_SECS = 1.0  # explainability: mute-one-second-at-a-time
+_MAGMA = plt.cm.magma  # colormap used by prep.py imsave
 
-MODEL_PATH = Path("model.pth")
-
-# ImageFolder sorts class dirs alphabetically — this is the model's output order
-MODEL_CLASSES = ["both", "crackle", "normal", "wheeze"]
-# display / dict order used throughout the rest of the app
-CLASSES = ["normal", "crackle", "wheeze", "both"]
-
-_transform = transforms.Compose([
-    transforms.Lambda(lambda img: img.convert("RGB")),
+# transform matches what ImageFolder applies (RGBA -> RGB was for PNG loading;
+# here we build an RGB PIL image directly, so no convert step needed)
+_TRANSFORM = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                          std=[0.229, 0.224, 0.225]),
+                         std=[0.229, 0.224, 0.225]),
 ])
 
-
-# ── model loading (once, cached) ─────────────────────────────────────────────
-@lru_cache(maxsize=1)
-def _load_model():
-    model = models.resnet18(weights=None)
-    model.fc = torch.nn.Linear(model.fc.in_features, len(MODEL_CLASSES))
-    state = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
-    return model
+_model = None
 
 
-def _empty_result(quality: str, message: str) -> dict:
-    return {
-        "label": "normal",
-        "confidence": 0.0,
-        "all_probs": {c: 0.25 for c in CLASSES},
-        "quality": quality,
-        "cycles": [],
-        "salient": None,
-        "spec": None,
-        "message": message,
-    }
+# ── model loading ─────────────────────────────────────────────────────────────
+def _load_model() -> nn.Module:
+    global _model
+    if _model is not None:
+        return _model
+    m = models.resnet18(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, 4)
+    for path in [Path("model2.pth"), Path("model.pth")]:
+        if path.exists():
+            m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+            break
+    else:
+        raise FileNotFoundError("No model weights found. Run train2.py or train.py first.")
+    m.eval()
+    _model = m
+    return _model
 
 
+# ── audio helpers ─────────────────────────────────────────────────────────────
 def _pad_or_trim(audio: np.ndarray, target: int) -> np.ndarray:
     if len(audio) >= target:
         return audio[:target]
     return np.concatenate([audio, np.zeros(target - len(audio), dtype=audio.dtype)])
 
 
-def _mel_db_to_rgb(mel_db_flipped: np.ndarray) -> np.ndarray:
-    """Reproduce mpimg.imsave(..., cmap='magma') exactly: per-array min/max
-    normalization through the magma colormap, dropping alpha. This is the
-    same pixel data the model was trained on."""
-    norm = mcolors.Normalize(vmin=mel_db_flipped.min(), vmax=mel_db_flipped.max())
-    rgba = matplotlib.colormaps["magma"](norm(mel_db_flipped))
-    return (rgba[..., :3] * 255).astype(np.uint8)
-
-
-def _window_spec(cycle_audio: np.ndarray) -> np.ndarray:
-    mel = librosa.feature.melspectrogram(
-        y=cycle_audio, sr=SR, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
-    )
+def _audio_to_tensor(y: np.ndarray) -> torch.Tensor:
+    """
+    Convert a normalised audio segment to a model-ready tensor.
+    Replicates prep.py exactly: mel -> power_to_db -> flipud -> normalise
+    to [0,1] -> magma colormap -> RGB PIL image -> ToTensor -> Normalize.
+    """
+    mel    = librosa.feature.melspectrogram(y=y, sr=SR, n_mels=N_MELS,
+                                             n_fft=N_FFT, hop_length=HOP_LENGTH)
     mel_db = librosa.power_to_db(mel, ref=np.max)
-    return np.flipud(mel_db)
+    img    = np.flipud(mel_db)
+
+    # Normalise to [0,1] as matplotlib's imsave does internally
+    lo, hi  = img.min(), img.max()
+    img_01  = (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
+
+    # Apply magma colormap -> RGBA [0,1] -> RGB uint8
+    rgba = _MAGMA(img_01)
+    rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
+    return _TRANSFORM(Image.fromarray(rgb, mode="RGB")).unsqueeze(0)  # [1,3,H,W]
 
 
-def _predict_probs(model, y: np.ndarray, window_bounds: list) -> np.ndarray:
-    """Run the model over each 5s window of y. Returns (n_windows, 4) softmax
-    probabilities in MODEL_CLASSES order."""
-    specs = []
-    for w0, _w1 in window_bounds:
-        s0 = int(w0 * SR)
-        s1 = s0 + CYCLE_SAMPLES
-        window_audio = _pad_or_trim(y[s0:s1], CYCLE_SAMPLES)
-        specs.append(_mel_db_to_rgb(_window_spec(window_audio)))
-
-    batch = torch.stack([_transform(_to_pil(s)) for s in specs])
+def _infer(tensor: torch.Tensor) -> np.ndarray:
     with torch.no_grad():
-        logits = model(batch)
-        probs = torch.softmax(logits, dim=1).numpy()
-    return probs
+        return torch.softmax(_load_model()(tensor), dim=1)[0].numpy()
 
 
+# ── public: single-cycle prediction ──────────────────────────────────────────
+def predict_cycle(y: np.ndarray) -> tuple:
+    """
+    Run model on one audio segment (numpy float32, already normalised, SR=4000).
+    Pads/trims to CYCLE_SAMPLES internally.
+    Returns (label, confidence, {class: probability}).
+    """
+    cycle = _pad_or_trim(y, CYCLE_SAMPLES)
+    probs = _infer(_audio_to_tensor(cycle))
+    idx   = int(np.argmax(probs))
+    return CLASSES[idx], float(probs[idx]), {c: float(p) for c, p in zip(CLASSES, probs)}
+
+
+# ── public: full analyze pipeline (CLAUDE.md contract) ───────────────────────
 def analyze(audio_file) -> dict:
     """
-    Classify a respiratory audio file. Never raises — unusable audio
-    or a missing model is reported back via quality="poor" + a message.
+    Load audio_file, quality-check, predict, find salient region.
+    Returns the dict specified in CLAUDE.md; on failure returns {"error": str}.
     """
-    # ── load ─────────────────────────────────────────────────────────────
+    # ── load & validate ──────────────────────────────────────────────────
     try:
         y, _ = librosa.load(audio_file, sr=SR)
     except Exception as exc:
-        return _empty_result("poor", f"could not read audio file: {exc}")
-
-    if len(y) == 0:
-        return _empty_result("poor", "audio file is empty")
+        return {"error": f"Could not load audio: {exc}"}
 
     duration = len(y) / SR
 
-    # ── graceful refusal gate ───────────────────────────────────────────
-    if duration < MIN_DURATION_SECS:
-        return _empty_result(
-            "poor", f"recording too short ({duration:.1f}s) - need at least "
-                    f"{MIN_DURATION_SECS:.0f}s"
-        )
+    if duration < MIN_DURATION:
+        return {"error": f"Audio too short ({duration:.1f}s — need ≥{MIN_DURATION}s)."}
 
-    mean_abs_amp = float(np.mean(np.abs(y)))
-    if mean_abs_amp < MIN_MEAN_ABS_AMP:
-        return _empty_result("poor", "signal too quiet - looks like silence, re-record")
-
-    try:
-        model = _load_model()
-    except Exception as exc:
-        return _empty_result("poor", f"model unavailable: {exc}")
-
-    # ── normalize (same as prep.py) ─────────────────────────────────────
     peak = np.max(np.abs(y))
-    if peak > 0:
-        y = y / peak
+    if peak < SILENCE_THR:
+        return {"error": "Audio appears silent. Check your microphone and re-record."}
 
-    # ── full-clip mel spectrogram, only for display in app.py ──────────
-    spec = _window_spec(y)
+    y = y / peak   # normalise once; all downstream slices share this
 
-    # ── chop into 5-second windows (proxy for breath cycles) and classify ─
-    window_starts = np.arange(0.0, duration, CYCLE_SECS)
-    window_bounds = [
-        (float(w_start), float(min(w_start + CYCLE_SECS, duration)))
-        for w_start in window_starts
-    ]
+    # ── fixed 5s windows (fallback segmentation for uploaded audio) ──────
+    n_cycles   = max(1, int(np.floor(len(y) / CYCLE_SAMPLES)))
+    cycles_out = []
+    all_probs  = []
 
-    probs = _predict_probs(model, y, window_bounds)  # (n_windows, 4), MODEL_CLASSES order
+    for i in range(n_cycles):
+        t0 = i * CYCLE_SECS
+        t1 = min(t0 + CYCLE_SECS, duration)
+        s0, s1 = int(t0 * SR), int(t1 * SR)
 
-    # ── per-window cycle labels ──────────────────────────────────────────
-    cycles = []
-    for (w0, w1), p in zip(window_bounds, probs):
-        cyc_label = MODEL_CLASSES[int(np.argmax(p))]
-        cycles.append((w0, w1, cyc_label))
+        label, conf, pd = predict_cycle(y[s0:s1])
+        cycles_out.append((t0, t1, label))
+        all_probs.append([pd[c] for c in CLASSES])
 
-    # ── overall prediction = mean probability across windows ────────────
-    mean_probs = probs.mean(axis=0)
-    all_probs = {cls: float(mean_probs[i]) for i, cls in enumerate(MODEL_CLASSES)}
-    label = max(all_probs, key=all_probs.get)
-    confidence = all_probs[label]
+    mean_probs = np.mean(all_probs, axis=0)
+    top_idx    = int(np.argmax(mean_probs))
+    label      = CLASSES[top_idx]
+    confidence = float(mean_probs[top_idx])
 
-    if confidence < MIN_TOP_CONFIDENCE:
-        return _empty_result("poor", "signal quality too low, re-record")
+    if confidence < CONF_THR:
+        return {"error": f"Signal quality too low (confidence={confidence:.2f}). Re-record."}
 
-    # ── occlusion explainability: mute 1s chunks, find the biggest drop ──
-    label_idx = MODEL_CLASSES.index(label)
-    n_chunks = int(np.ceil(duration / OCCLUSION_CHUNK_SECS))
-    salient = (0.0, min(OCCLUSION_CHUNK_SECS, duration))
-    best_drop = -np.inf
-    for i in range(n_chunks):
-        c0 = i * OCCLUSION_CHUNK_SECS
-        c1 = min(c0 + OCCLUSION_CHUNK_SECS, duration)
-        y_muted = y.copy()
-        y_muted[int(c0 * SR):int(c1 * SR)] = 0.0
+    quality = "good" if confidence >= 0.7 else "poor"
 
-        muted_probs = _predict_probs(model, y_muted, window_bounds).mean(axis=0)
-        drop = confidence - float(muted_probs[label_idx])
+    # ── salient region: mute 1s chunks, find largest confidence drop ─────
+    probe   = _pad_or_trim(y, CYCLE_SAMPLES)
+    base_c  = float(_infer(_audio_to_tensor(probe))[top_idx])
+    chunk_n = SR   # 1 second of samples
 
+    best_drop, salient = -1.0, (0.0, 1.0)
+    for k in range(int(CYCLE_SECS)):
+        muted = probe.copy()
+        muted[k * chunk_n : (k + 1) * chunk_n] = 0.0
+        drop  = base_c - float(_infer(_audio_to_tensor(muted))[top_idx])
         if drop > best_drop:
             best_drop = drop
-            salient = (c0, c1)
+            salient   = (float(k), float(k + 1))
+
+    # ── mel spectrogram of first 5s for display ──────────────────────────
+    mel  = librosa.feature.melspectrogram(y=probe, sr=SR, n_mels=N_MELS,
+                                           n_fft=N_FFT, hop_length=HOP_LENGTH)
+    spec = librosa.power_to_db(mel, ref=np.max)
 
     return {
-        "label": label,
+        "label":      label,
         "confidence": confidence,
-        "all_probs": all_probs,
-        "quality": "good",
-        "cycles": cycles,
-        "salient": salient,
-        "spec": spec,
-        "message": None,
+        "all_probs":  {c: float(p) for c, p in zip(CLASSES, mean_probs)},
+        "quality":    quality,
+        "cycles":     cycles_out,
+        "salient":    salient,
+        "spec":       spec,
     }
-
-
-def _to_pil(rgb_array: np.ndarray):
-    from PIL import Image
-    return Image.fromarray(rgb_array, mode="RGB")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("usage: predict.py path\\to\\file.wav")
-        sys.exit(1)
-
-    path = Path(sys.argv[1])
-    result = analyze(path)
-
-    print(f"file:       {path.name}")
-    print(f"quality:    {result['quality']}")
-    if result["message"]:
-        print(f"message:    {result['message']}")
-    print(f"label:      {result['label']}")
-    print(f"confidence: {result['confidence']:.2f}")
-    print(f"all_probs:  {result['all_probs']}")
-    print(f"cycles:     {result['cycles']}")
-    print(f"salient:    {result['salient']}")
-    spec = result["spec"]
-    print(f"spec shape: {spec.shape if spec is not None else None}")
