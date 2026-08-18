@@ -32,6 +32,11 @@ MIN_DURATION  = 2.0
 SILENCE_THR   = 0.005
 CONF_THR      = 0.15
 
+# Signal quality thresholds
+CLIP_RATIO_THR = 0.01    # >1% of samples at max amplitude = clipping
+RMS_MIN_THR    = 0.008   # RMS below this = too quiet
+SNR_MIN_DB     = 6.0     # SNR below this = excessive noise
+
 _MAGMA = plt.cm.magma  # colormap used by prep.py imsave
 
 _TRANSFORM = transforms.Compose([
@@ -182,21 +187,70 @@ def predict_cycle(y: np.ndarray) -> tuple:
     return CLASSES[idx], float(probs[idx]), {c: float(p) for c, p in zip(CLASSES, probs)}
 
 
+# ── signal quality checks ─────────────────────────────────────────────────────
+def _check_signal_quality(y_raw: np.ndarray, sr: int = SR) -> tuple:
+    """Run signal quality checks on raw (unnormalized) audio.
+    Returns (passed: bool, reason: str).
+    """
+    # Clipping detection: fraction of samples at or near max amplitude
+    abs_y = np.abs(y_raw)
+    peak = np.max(abs_y) if len(abs_y) > 0 else 0.0
+    if peak > 0:
+        clip_ratio = np.mean(abs_y >= 0.99 * peak)
+        if clip_ratio > CLIP_RATIO_THR:
+            return False, f"Audio clipped ({clip_ratio:.1%} of samples at max amplitude). Reduce input gain and re-record."
+
+    # RMS level check
+    rms = float(np.sqrt(np.mean(y_raw ** 2)))
+    if rms < RMS_MIN_THR:
+        return False, f"Signal too quiet (RMS={rms:.4f}). Increase microphone sensitivity or move closer."
+
+    # SNR estimation: compare signal RMS to noise floor
+    # Noise floor estimated from bottom 10th percentile of short-time frame energies
+    frame_len = int(0.025 * sr)  # 25ms frames
+    hop = frame_len // 2
+    n_frames = max(1, (len(y_raw) - frame_len) // hop)
+    frame_energies = np.array([
+        np.sqrt(np.mean(y_raw[i * hop : i * hop + frame_len] ** 2))
+        for i in range(n_frames)
+    ])
+    noise_floor = float(np.percentile(frame_energies, 10)) if len(frame_energies) > 0 else rms
+    if noise_floor > 0:
+        snr_db = 20.0 * np.log10(rms / noise_floor)
+    else:
+        snr_db = 60.0  # effectively clean
+    if snr_db < SNR_MIN_DB:
+        return False, f"Excessive background noise detected (SNR={snr_db:.1f} dB). Find a quieter environment and re-record."
+
+    return True, "Passed all signal quality checks"
+
+
 # ── public: full analyze pipeline (CLAUDE.md contract) ───────────────────────
 def analyze(audio_file) -> dict:
     try:
         y, _ = librosa.load(audio_file, sr=SR)
     except Exception as exc:
-        return {"error": f"Could not load audio: {exc}"}
+        return {"error": f"Could not load audio: {exc}",
+                "quality": "rejected", "quality_reason": f"Could not load audio: {exc}"}
 
     duration = len(y) / SR
 
     if duration < MIN_DURATION:
-        return {"error": f"Audio too short ({duration:.1f}s — need ≥{MIN_DURATION}s)."}
+        return {"error": f"Audio too short ({duration:.1f}s — need ≥{MIN_DURATION}s).",
+                "quality": "rejected",
+                "quality_reason": f"Audio duration too short ({duration:.1f}s, minimum {MIN_DURATION}s required)"}
 
     peak = np.max(np.abs(y))
     if peak < SILENCE_THR:
-        return {"error": "Audio appears silent. Check your microphone and re-record."}
+        return {"error": "Audio appears silent. Check your microphone and re-record.",
+                "quality": "rejected",
+                "quality_reason": "Audio appears silent (peak amplitude below threshold). Check microphone connection."}
+
+    # Advanced signal quality checks (on raw audio before normalization)
+    sq_passed, sq_reason = _check_signal_quality(y)
+    if not sq_passed:
+        return {"error": sq_reason,
+                "quality": "rejected", "quality_reason": sq_reason}
 
     y = y / peak
 
@@ -219,22 +273,39 @@ def analyze(audio_file) -> dict:
     confidence = float(mean_probs[top_idx])
 
     if confidence < CONF_THR:
-        return {"error": f"Signal quality too low (confidence={confidence:.2f}). Re-record."}
+        return {"error": f"Signal quality too low (confidence={confidence:.2f}). Re-record.",
+                "quality": "rejected",
+                "quality_reason": f"Classification confidence too low ({confidence:.0%}). Audio may be too noisy or ambiguous."}
 
     quality = "good" if confidence >= 0.30 else "poor"
+    quality_reason = sq_reason if quality == "good" else f"Low classification confidence ({confidence:.0%})"
 
     probe   = _pad_or_trim(y, CYCLE_SAMPLES)
     base_c  = float(_infer(_audio_to_tensor(probe))[top_idx])
-    chunk_n = SR
 
-    best_drop, salient = -1.0, (0.0, 1.0)
-    for k in range(int(CYCLE_SECS)):
+    # Fine-grained occlusion sweep (0.5s windows) for evidence heatmap
+    OCCL_WINDOW = 0.5  # seconds
+    occl_samples = int(OCCL_WINDOW * SR)
+    n_windows = int(CYCLE_SECS / OCCL_WINDOW)
+
+    heatmap_timeline = []
+    best_drop, salient = -1.0, (0.0, OCCL_WINDOW)
+    for k in range(n_windows):
+        t0_w = k * OCCL_WINDOW
+        t1_w = t0_w + OCCL_WINDOW
+        s0_w = int(t0_w * SR)
+        s1_w = int(t1_w * SR)
         muted = probe.copy()
-        muted[k * chunk_n : (k + 1) * chunk_n] = 0.0
-        drop  = base_c - float(_infer(_audio_to_tensor(muted))[top_idx])
+        muted[s0_w:s1_w] = 0.0
+        drop = base_c - float(_infer(_audio_to_tensor(muted))[top_idx])
+        heatmap_timeline.append((t0_w, t1_w, float(drop)))
         if drop > best_drop:
             best_drop = drop
-            salient   = (float(k), float(k + 1))
+            salient = (t0_w, t1_w)
+
+    # Evidence regions: windows where drop is above 50% of peak drop
+    drop_threshold = max(best_drop * 0.5, 0.01) if best_drop > 0 else 0.01
+    evidence_regions = [(t0, t1, d) for t0, t1, d in heatmap_timeline if d >= drop_threshold]
 
     mel  = librosa.feature.melspectrogram(y=probe, sr=SR, n_mels=N_MELS,
                                            n_fft=N_FFT, hop_length=HOP_LENGTH)
@@ -242,12 +313,15 @@ def analyze(audio_file) -> dict:
     gradcam_map = generate_gradcam(probe, target_label=label)
 
     return {
-        "label":      label,
-        "confidence": confidence,
-        "all_probs":  {c: float(p) for c, p in zip(CLASSES, mean_probs)},
-        "quality":    quality,
-        "cycles":     cycles_out,
-        "salient":    salient,
-        "spec":       spec,
-        "gradcam":    gradcam_map,
+        "label":            label,
+        "confidence":       confidence,
+        "all_probs":        {c: float(p) for c, p in zip(CLASSES, mean_probs)},
+        "quality":          quality,
+        "quality_reason":   quality_reason,
+        "cycles":           cycles_out,
+        "salient":          salient,
+        "heatmap_timeline": heatmap_timeline,
+        "evidence_regions": evidence_regions,
+        "spec":             spec,
+        "gradcam":          gradcam_map,
     }

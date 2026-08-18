@@ -131,7 +131,8 @@ def full_spectrogram(y: np.ndarray) -> np.ndarray:
 
 def plot_spectrogram(spec: np.ndarray, duration: float,
                      salient: tuple | None = None,
-                     gradcam: np.ndarray | None = None) -> plt.Figure:
+                     gradcam: np.ndarray | None = None,
+                     heatmap_timeline: list | None = None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(10, 2.5))
     ax.imshow(np.flipud(spec), aspect="auto", origin="upper", cmap="magma",
               extent=[0, duration, 0, N_MELS])
@@ -142,9 +143,23 @@ def plot_spectrogram(spec: np.ndarray, duration: float,
     ax.set_ylabel("Mel bin")
     title = "Mel Spectrogram + Grad-CAM Heatmap" if gradcam is not None else "Mel Spectrogram"
     ax.set_title(title)
+    
+    if heatmap_timeline:
+        # Plot all regions with alpha proportional to confidence drop
+        max_drop = max([drop for _, _, drop in heatmap_timeline] + [0.01])
+        for t0, t1, drop in heatmap_timeline:
+            if drop > 0:
+                alpha_val = min(0.4, max(0.05, (drop / max_drop) * 0.35))
+                # Shading color: red for major drop, cyan for minor
+                color_val = "red" if drop > 0.5 * max_drop else "cyan"
+                ax.axvspan(t0, t1, color=color_val, alpha=alpha_val)
+                
     if salient:
-        ax.axvspan(salient[0], salient[1], color="cyan", alpha=0.3, label="Salient region")
+        # Overlay outline on the peak salient region
+        ax.axvline(salient[0], color="cyan", linestyle="--", linewidth=1.5)
+        ax.axvline(salient[1], color="cyan", linestyle="--", linewidth=1.5, label="Peak salient region")
         ax.legend(fontsize=8, loc="upper right")
+        
     fig.tight_layout()
     return fig
 
@@ -178,20 +193,40 @@ def plot_timeline(rows: list[tuple], row_labels: list[str], duration: float) -> 
     return fig
 
 
+def _confidence_color(prob: float) -> str:
+    """Return color based on confidence thresholds: green >= 70%, yellow 50-70%, red < 50%."""
+    if prob >= 0.70:
+        return "#4CAF50"  # green
+    elif prob >= 0.50:
+        return "#FFC107"  # yellow/amber
+    else:
+        return "#F44336"  # red
+
+
 def plot_confidence(probs: dict) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(5, 2.2))
     labels  = list(probs.keys())
     values  = [probs[l] for l in labels]
-    colors  = [LABEL_COLORS[l] for l in labels]
-    bars    = ax.barh(labels, values, color=colors)
+    colors  = [_confidence_color(v) for v in values]
+    bars    = ax.barh(labels, values, color=colors, edgecolor="white", linewidth=0.5)
     ax.set_xlim(0, 1)
     ax.set_xlabel("Probability")
     ax.set_title("Class probabilities")
     for bar, v in zip(bars, values):
         ax.text(min(v + 0.02, 0.98), bar.get_y() + bar.get_height() / 2,
-                f"{v:.2f}", va="center", fontsize=9)
+                f"{v:.0%}", va="center", fontsize=9, fontweight="bold")
     fig.tight_layout()
     return fig
+
+
+def confidence_badge_html(label: str, confidence: float) -> str:
+    """Return HTML for a color-coded confidence badge."""
+    color = _confidence_color(confidence)
+    return (
+        f'<div style="display:inline-block; padding:6px 16px; border-radius:8px; '
+        f'background:{color}; color:white; font-weight:bold; font-size:1.1em;">'
+        f'{label.upper()} — {confidence:.0%}</div>'
+    )
 
 
 # ── page layout ───────────────────────────────────────────────────────────────
@@ -258,14 +293,37 @@ def show_analyze_result(audio_source, display_name: str) -> None:
 
     if "error" in result:
         st.error(result["error"])
+        if result.get("quality_reason"):
+            st.warning(f"⚠️ **Please retake:** {result['quality_reason']}")
         return
 
     quality_tag = "[good]" if result["quality"] == "good" else "[poor quality]"
-    st.markdown(
-        f"### Prediction: **{result['label'].upper()}**  "
-        f"-- confidence {result['confidence']:.0%}  {quality_tag}"
-    )
+
+    # Color-coded confidence badge
+    st.markdown(confidence_badge_html(result["label"], result["confidence"]),
+                unsafe_allow_html=True)
     st.caption("This describes the sound only, not a medical diagnosis.")
+
+    # Per-class color-coded progress bars
+    st.markdown("**Class confidence breakdown:**")
+    for cls_name, prob_val in sorted(result["all_probs"].items(), key=lambda x: -x[1]):
+        color = _confidence_color(prob_val)
+        bar_width = max(prob_val * 100, 1)
+        st.markdown(
+            f'<div style="margin:2px 0;display:flex;align-items:center;">'
+            f'<span style="width:80px;font-size:0.85em;font-weight:600;">{cls_name.capitalize()}</span>'
+            f'<div style="flex:1;background:#eee;border-radius:4px;height:18px;margin:0 8px;">'
+            f'<div style="width:{bar_width}%;background:{color};height:100%;border-radius:4px;'
+            f'transition:width 0.3s;"></div></div>'
+            f'<span style="font-size:0.85em;font-weight:bold;color:{color};">{prob_val:.0%}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # Show quality reason if not good
+    if result["quality"] != "good" and result.get("quality_reason"):
+        st.warning(f"⚠️ **Signal quality issue:** {result['quality_reason']}")
+    elif result.get("quality_reason"):
+        st.success(f"✅ {result['quality_reason']}")
 
     col_spec, col_conf = st.columns([3, 1])
     with col_spec:
@@ -273,20 +331,46 @@ def show_analyze_result(audio_source, display_name: str) -> None:
 
         with tab1:
             st.pyplot(
-                plot_spectrogram(result["spec"], 5.0, salient=result["salient"]),
+                plot_spectrogram(
+                    result["spec"], 
+                    5.0, 
+                    salient=result["salient"], 
+                    heatmap_timeline=result.get("heatmap_timeline")
+                ),
                 use_container_width=True,
             )
             st.caption(
-                f"Cyan band = most influential 1-second region "
-                f"({result['salient'][0]:.0f}--{result['salient'][1]:.0f} s)"
+                "🔴 **Evidence Heatmap Overlay:** Red & Cyan shaded regions show segments that drove "
+                "the classification decision. Darker red indicates higher decision influence."
             )
+            
+            # Sub-layout for playing different evidence segments
+            st.write("🔊 **Play Highlighted Evidence Segments:**")
+            
+            # Option A: Play peak salient segment
             salient_bytes = create_salient_audio_bytes(audio_source, result["salient"])
             if salient_bytes:
                 st.audio(salient_bytes, format="audio/wav")
                 st.caption(
-                    f"🔊 **Play Salient 1-Second Audio** "
-                    f"({result['salient'][0]:.0f}--{result['salient'][1]:.0f} s) — What the AI heard"
+                    f"🔊 **Peak Salient Segment** "
+                    f"({result['salient'][0]:.2f}s -- {result['salient'][1]:.2f}s) — Maximum decision influence"
                 )
+            
+            # Option B: Dropdown to play any other highlighted evidence region
+            evidence_regions = result.get("evidence_regions", [])
+            if len(evidence_regions) > 1:
+                options = [f"Select another segment to play..."] + [
+                    f"Region {i+1}: {t0:.2f}s - {t1:.2f}s (drop: {drop:.1%})"
+                    for i, (t0, t1, drop) in enumerate(evidence_regions)
+                ]
+                selected_opt = st.selectbox("Or choose a specific region to listen:", options, index=0)
+                if selected_opt != "Select another segment to play...":
+                    selected_idx = options.index(selected_opt) - 1
+                    t0, t1, _ = evidence_regions[selected_idx]
+                    custom_bytes = create_salient_audio_bytes(audio_source, (t0, t1))
+                    if custom_bytes:
+                        st.audio(custom_bytes, format="audio/wav")
+                        st.caption(f"🔊 Playing selected region segment: {t0:.2f}s - {t1:.2f}s")
 
         with tab2:
             if "gradcam" in result:
@@ -344,8 +428,24 @@ This software is intended for clinical decision
 support and does NOT output a medical diagnosis.
 ==================================================
 """
+    # Generate HTML report
+    from report_generator import generate_report
+    try:
+        html_report_path = generate_report(result, display_name)
+        with open(html_report_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        
+        st.download_button(
+            label="📄 Download Clinical Summary Report (HTML)",
+            data=html_content,
+            file_name=f"echoassist_clinical_report_{result['label']}.html",
+            mime="text/html",
+        )
+    except Exception as e:
+        st.error(f"Error generating clinical report: {e}")
+
     st.download_button(
-        label="📄 Download Summary Report (.txt)",
+        label="📝 Download Text Summary Report (.txt)",
         data=report_text,
         file_name=f"echoassist_report_{result['label']}.txt",
         mime="text/plain",

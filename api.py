@@ -101,6 +101,31 @@ async def list_samples():
     return available
 
 
+@app.get("/api/report/{name}")
+async def get_clinical_report(name: str):
+    """Generate and return clinical HTML report for a sample file."""
+    from report_generator import generate_report
+    from fastapi.responses import FileResponse
+    
+    wav = SAMPLES_DIR / name
+    if not wav.exists():
+        raise HTTPException(status_code=404, detail=f"Sample not found: {name}")
+        
+    result = analyze(str(wav))
+    if "error" in result and result.get("quality") == "rejected":
+        # Report can still be generated for failed quality gates to show details
+        pass
+    elif "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+        
+    report_path = generate_report(result, str(wav))
+    return FileResponse(
+        path=report_path, 
+        filename=Path(report_path).name, 
+        media_type="text/html"
+    )
+
+
 # Serve frontend static files — mount last so API routes take priority
 frontend_dir = Path("frontend")
 if frontend_dir.exists():

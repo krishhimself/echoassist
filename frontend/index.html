@@ -487,6 +487,17 @@ nav.show { opacity: 1; transform: translateY(0); }
 .prob-fill[data-class="wheeze"] { background: #6EB8A0; }
 .prob-fill[data-class="both"] { background: #C07AA0; }
 
+/* Quality reason banner */
+.quality-reason-banner {
+  display: flex; align-items: flex-start; gap: 0.85rem;
+  padding: 0.9rem 1.25rem; border-radius: 4px; margin-bottom: 1.5rem;
+  font-size: 0.8rem; line-height: 1.55;
+  border: 1px solid rgba(143,196,232,0.25);
+  background: rgba(143,196,232,0.07);
+  color: rgba(220,234,246,0.75);
+}
+.quality-reason-banner .qr-icon { font-size: 1.1rem; flex-shrink: 0; margin-top: 0.05rem; }
+
 /* Gradcam */
 .gradcam-wrap {
   margin-top: 1.5rem; border: 1px solid var(--echo30); border-radius: 4px; overflow: hidden;
@@ -496,6 +507,53 @@ nav.show { opacity: 1; transform: translateY(0); }
 .gradcam-label {
   font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase;
   color: rgba(220,234,246,0.4); margin-bottom: 0.75rem;
+}
+.gradcam-legend {
+  font-size: 0.62rem; color: rgba(220,234,246,0.35); margin-top: 0.4rem;
+  display: flex; align-items: center; gap: 0.5rem;
+}
+.gradcam-legend-bar {
+  width: 80px; height: 6px; border-radius: 3px; flex-shrink: 0;
+  background: linear-gradient(to right, #000080, #0080ff, #00ff80, #ffff00, #ff0000);
+}
+
+/* Heatmap timeline (occlusion sensitivity) */
+.heatmap-wrap { margin-top: 2rem; }
+.heatmap-label {
+  font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase;
+  color: rgba(220,234,246,0.4); margin-bottom: 0.5rem;
+}
+.heatmap-bar-wrap {
+  position: relative; height: 36px;
+  border: 1px solid var(--echo30); border-radius: 3px; overflow: hidden;
+  display: flex;
+}
+.heatmap-seg {
+  height: 100%; flex-shrink: 0;
+  transition: opacity 0.3s;
+  position: relative;
+}
+.heatmap-seg:hover::after {
+  content: attr(title);
+  position: absolute; bottom: 110%; left: 50%; transform: translateX(-50%);
+  background: rgba(36,59,83,0.95); color: var(--mist);
+  font-size: 0.62rem; padding: 0.2rem 0.5rem; border-radius: 2px;
+  white-space: nowrap; pointer-events: none; z-index: 10;
+}
+.heatmap-baseline { position: absolute; bottom: 0; left: 0; right: 0; height: 1px; background: rgba(111,159,216,0.2); }
+.heatmap-sub { font-size: 0.62rem; color: rgba(220,234,246,0.3); margin-top: 0.4rem; }
+
+/* Evidence regions */
+.evidence-wrap { margin-top: 1.25rem; }
+.evidence-label {
+  font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase;
+  color: rgba(220,234,246,0.4); margin-bottom: 0.5rem;
+}
+.evidence-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.evidence-chip {
+  font-size: 0.7rem; padding: 0.3rem 0.75rem; border-radius: 2px;
+  border: 1px solid rgba(244,233,184,0.4); color: var(--cream);
+  background: rgba(244,233,184,0.06);
 }
 
 /* Timeline */
@@ -520,6 +578,47 @@ nav.show { opacity: 1; transform: translateY(0); }
 .timeline-seg[data-class="crackle"] { background: rgba(229,160,80,0.5); }
 .timeline-seg[data-class="wheeze"] { background: rgba(110,184,160,0.5); }
 .timeline-seg[data-class="both"] { background: rgba(192,122,160,0.5); }
+
+/* Cycle breakdown table */
+.cycle-table-wrap { margin-top: 1.25rem; overflow-x: auto; }
+.cycle-table {
+  width: 100%; border-collapse: collapse;
+  font-size: 0.75rem;
+}
+.cycle-table th {
+  font-size: 0.62rem; letter-spacing: 0.12em; text-transform: uppercase;
+  color: rgba(220,234,246,0.35); padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid rgba(111,159,216,0.15);
+  text-align: left; font-weight: 500;
+}
+.cycle-table td {
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid rgba(111,159,216,0.07);
+  color: rgba(220,234,246,0.65);
+}
+.cycle-table tr:hover td { background: rgba(111,159,216,0.05); }
+.cycle-badge {
+  display: inline-block; padding: 0.15rem 0.5rem; border-radius: 2px;
+  font-size: 0.65rem; font-weight: 500; text-transform: capitalize;
+}
+.cycle-badge[data-class="normal"]  { background: rgba(111,159,216,0.2); color: #8FC4E8; }
+.cycle-badge[data-class="crackle"] { background: rgba(229,160,80,0.2);  color: #E5B980; }
+.cycle-badge[data-class="wheeze"]  { background: rgba(110,184,160,0.2); color: #8FD4B8; }
+.cycle-badge[data-class="both"]    { background: rgba(192,122,160,0.2); color: #D4A0C0; }
+
+/* Report download */
+.report-btn-row { margin-top: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+.report-btn {
+  display: inline-flex; align-items: center; gap: 0.6rem;
+  font-size: 0.75rem; font-weight: 500; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--navy);
+  background: var(--echo); padding: 0.7rem 1.6rem; border-radius: 2px;
+  border: none; cursor: pointer;
+  transition: opacity 0.2s;
+  text-decoration: none;
+}
+.report-btn:hover { opacity: 0.85; }
+.report-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
 
 /* ── FOOTER ──────────────────────────────────────────────────────────────── */
 footer {
@@ -1292,7 +1391,72 @@ function renderResult(result) {
       title="${lbl} ${t0.toFixed(1)}s–${t1.toFixed(1)}s">${pct > 8 ? lbl : ''}</div>`;
   }).join('');
 
+  // ── Build heatmap timeline HTML ──
+  const heatmap   = result.heatmap_timeline || [];
+  const evidence  = result.evidence_regions || [];
+  const qualReason = result.quality_reason || '';
+
+  let heatmapHTML = '';
+  if (heatmap.length > 0) {
+    const maxDelta = Math.max(...heatmap.map(([,,d]) => Math.abs(d)), 1e-9);
+    const totalHeat = heatmap[heatmap.length - 1][1];
+    heatmapHTML = heatmap.map(([t0, t1, delta]) => {
+      const pct = ((t1 - t0) / totalHeat * 100).toFixed(2);
+      const norm = delta / maxDelta;  // -1..1
+      const intensity = Math.abs(norm);
+      // Positive = warm (influential), negative = cool
+      const [r,g,b] = norm > 0
+        ? [244, Math.round(233 - intensity*100), Math.round(184 - intensity*150)]
+        : [Math.round(111 + intensity*50), Math.round(159 + intensity*40), 216];
+      const alpha = 0.15 + intensity * 0.65;
+      return `<div class="heatmap-seg" style="width:${pct}%;background:rgba(${r},${g},${b},${alpha})"
+        title="${t0.toFixed(1)}s–${t1.toFixed(1)}s Δconfidence: ${(delta*100).toFixed(2)}%"></div>`;
+    }).join('');
+  }
+
+  // ── Evidence region chips ──
+  const evidenceChipsHTML = evidence.length > 0
+    ? evidence.map(([t0, t1, d]) =>
+        `<span class="evidence-chip">⚡ ${t0.toFixed(1)}s – ${t1.toFixed(1)}s (Δ${(d*100).toFixed(1)}%)</span>`
+      ).join('')
+    : '';
+
+  // ── Cycle breakdown table ──
+  const cycleTableHTML = cycles.length > 0 ? `
+    <div class="cycle-table-wrap">
+      <table class="cycle-table">
+        <thead><tr><th>#</th><th>Start</th><th>End</th><th>Duration</th><th>Prediction</th></tr></thead>
+        <tbody>
+          ${cycles.map(([t0, t1, lbl], idx) => `
+            <tr>
+              <td style="color:rgba(220,234,246,0.35)">${idx+1}</td>
+              <td>${t0.toFixed(2)}s</td>
+              <td>${t1.toFixed(2)}s</td>
+              <td>${(t1-t0).toFixed(2)}s</td>
+              <td><span class="cycle-badge" data-class="${lbl}">${lbl}</span></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>` : '';
+
+  // ── Report button ──
+  const reportBtnHTML = selectedSample
+    ? `<div class="report-btn-row">
+        <a class="report-btn" href="${API}/api/report/${selectedSample.file}" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M3 2h7l3 3v9H3z"/><path d="M10 2v3h3"/><path d="M5 8h6M5 11h4"/>
+          </svg>
+          Download Clinical Report
+        </a>
+      </div>` : '';
+
   resultPanel.innerHTML = `
+    ${qualReason ? `
+    <div class="quality-reason-banner">
+      <span class="qr-icon">${qual === 'good' ? '✅' : '⚠️'}</span>
+      <span>${escapeHTML(qualReason)}</span>
+    </div>` : ''}
+
     <div class="result-class-row">
       <span class="result-class-tag">Detected acoustic feature</span>
     </div>
@@ -1318,8 +1482,8 @@ function renderResult(result) {
       <div class="salient-info">
         <div class="salient-info-title">Hear what the model heard</div>
         <div class="salient-info-desc">
-          The most influential 1-second window: ${salient[0].toFixed(1)}s – ${salient[1].toFixed(1)}s<br>
-          This segment caused the largest confidence change when muted.
+          Most influential window: <strong style="color:var(--cream)">${salient[0].toFixed(1)}s – ${salient[1].toFixed(1)}s</strong><br>
+          This segment caused the largest confidence drop when muted.
         </div>
       </div>
     </div>
@@ -1328,7 +1492,7 @@ function renderResult(result) {
     <div class="result-grid">
       <div class="result-main">
         ${spec ? `
-        <div class="spec-label">Mel Spectrogram — first 5 s</div>
+        <div class="spec-label">Mel Spectrogram + Grad-CAM overlay — first 5 s</div>
         <div class="spec-wrap">
           <canvas id="spec-canvas" width="800" height="320"></canvas>
           ${salientPct ? `<div class="spec-salient-overlay" id="spec-salient-overlay"
@@ -1338,16 +1502,37 @@ function renderResult(result) {
         </div>` : ''}
 
         ${gradcam ? `
-        <div class="gradcam-label">Grad-CAM activation map</div>
+        <div class="gradcam-label">Grad-CAM activation map (standalone)</div>
         <div class="gradcam-wrap">
           <canvas id="gradcam-canvas" width="800" height="240"></canvas>
+        </div>
+        <div class="gradcam-legend">
+          <span>Low</span>
+          <div class="gradcam-legend-bar"></div>
+          <span>High activation</span>
+        </div>` : ''}
+
+        ${heatmap.length > 0 ? `
+        <div class="heatmap-wrap">
+          <div class="heatmap-label">Occlusion sensitivity timeline — influence per 0.5 s window</div>
+          <div class="heatmap-bar-wrap">${heatmapHTML}<div class="heatmap-baseline"></div></div>
+          <div class="heatmap-sub">Warmer = higher confidence drop when muted → more influential</div>
+        </div>` : ''}
+
+        ${evidenceChipsHTML ? `
+        <div class="evidence-wrap">
+          <div class="evidence-label">Top evidence regions (occlusion)</div>
+          <div class="evidence-chips">${evidenceChipsHTML}</div>
         </div>` : ''}
 
         ${cycles.length > 0 ? `
         <div class="timeline-wrap">
-          <div class="timeline-label">Cycle timeline</div>
+          <div class="timeline-label">Breath cycle timeline</div>
           <div class="timeline-track">${timelineHTML}</div>
-        </div>` : ''}
+        </div>
+        ${cycleTableHTML}` : ''}
+
+        ${reportBtnHTML}
       </div>
 
       <div class="result-aside">
@@ -1360,31 +1545,26 @@ function renderResult(result) {
   resultPanel.classList.add('visible');
   resultPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-  // Draw spec canvas
-  if (spec) drawSpecCanvas(spec, document.getElementById('spec-canvas'), salientPct, totalDur);
-  // Draw gradcam canvas
+  // Draw spec canvas with gradcam overlay blended on top
+  if (spec) drawSpecCanvas(spec, document.getElementById('spec-canvas'), salientPct, totalDur, gradcam);
+  // Draw standalone gradcam canvas
   if (gradcam) drawGradcamCanvas(gradcam, document.getElementById('gradcam-canvas'));
 
-  // Salient audio
-  if (salient && selectedSample) {
+  // Salient audio — works for both samples and uploads
+  if (salient) {
     const audioEl = document.getElementById('salient-audio-el');
     const playBtn = document.getElementById('salient-play');
-    const url = `${API}/api/salient-audio/${selectedSample.file}?t0=${salient[0]}&t1=${salient[1]}`;
-    audioEl.src = url;
-    if (playBtn) {
+    if (audioEl && playBtn) {
+      if (selectedSample) {
+        audioEl.src = `${API}/api/salient-audio/${selectedSample.file}?t0=${salient[0]}&t1=${salient[1]}`;
+      }
       playBtn.addEventListener('click', () => {
         if (audioEl.paused) audioEl.play();
         else audioEl.pause();
       });
-      audioEl.addEventListener('ended', () => {
-        playBtn.querySelector('path').setAttribute('d', 'M5 3l14 9L5 21z');
-      });
-      audioEl.addEventListener('play', () => {
-        playBtn.querySelector('path').setAttribute('d', 'M6 19h4V5H6v14zm8-14v14h4V5h-4z');
-      });
-      audioEl.addEventListener('pause', () => {
-        playBtn.querySelector('path').setAttribute('d', 'M5 3l14 9L5 21z');
-      });
+      audioEl.addEventListener('ended', () => playBtn.querySelector('path').setAttribute('d', 'M5 3l14 9L5 21z'));
+      audioEl.addEventListener('play',  () => playBtn.querySelector('path').setAttribute('d', 'M6 19h4V5H6v14zm8-14v14h4V5h-4z'));
+      audioEl.addEventListener('pause', () => playBtn.querySelector('path').setAttribute('d', 'M5 3l14 9L5 21z'));
     }
   }
 }
@@ -1392,13 +1572,14 @@ function renderResult(result) {
 /* ══════════════════════════════════════════════════════════════════════════
    CANVAS RENDERERS
 ══════════════════════════════════════════════════════════════════════════ */
-function drawSpecCanvas(specData, canvas, salientPct, totalDur) {
+function drawSpecCanvas(specData, canvas, salientPct, totalDur, gradcamData) {
   if (!canvas || !specData) return;
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   const rows = specData.length, cols = specData[0].length;
   const bw = W / cols, bh = H / rows;
 
+  // 1. Draw base spectrogram
   specData.forEach((row, ri) => {
     row.forEach((val, ci) => {
       const norm = Math.max(0, Math.min(1, (val + 80) / 80));
@@ -1407,6 +1588,25 @@ function drawSpecCanvas(specData, canvas, salientPct, totalDur) {
       ctx.fillRect(ci * bw, (rows - 1 - ri) * bh, bw + 0.5, bh + 0.5);
     });
   });
+
+  // 2. Overlay Grad-CAM heatmap blended on top (alpha=0.45)
+  if (gradcamData && gradcamData.length > 0) {
+    const gcRows = gradcamData.length, gcCols = gradcamData[0].length;
+    const gbw = W / gcCols, gbh = H / gcRows;
+    gradcamData.forEach((row, ri) => {
+      row.forEach((val, ci) => {
+        const v = Math.max(0, Math.min(1, val));
+        if (v < 0.05) return; // skip near-zero to keep spectrogram visible
+        let r, g, b;
+        if (v < 0.25)      { r = 0;   g = 0;                      b = Math.round((0.5 + v*2)*255); }
+        else if (v < 0.5)  { r = 0;   g = Math.round((v-0.25)*4*255); b = 255; }
+        else if (v < 0.75) { r = Math.round((v-0.5)*4*255); g = 255; b = Math.round((1-(v-0.5)*4)*255); }
+        else               { r = 255; g = Math.round((1-(v-0.75)*4)*255); b = 0; }
+        ctx.fillStyle = `rgba(${r},${g},${b},${0.12 + v * 0.38})`;
+        ctx.fillRect(ci * gbw, (gcRows - 1 - ri) * gbh, gbw + 0.5, gbh + 0.5);
+      });
+    });
+  }
 }
 
 function drawGradcamCanvas(gcData, canvas) {
